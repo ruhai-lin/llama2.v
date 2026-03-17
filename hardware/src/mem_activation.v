@@ -5,7 +5,9 @@ module mem_activation #(
     parameter N_HEADS = 8,
     parameter MAX_SEQ_LEN = 512,
     parameter N_KV_HEADS = 4
-) ();
+) (
+    input wire rst_n
+);
 
 localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
 
@@ -46,5 +48,11 @@ task zero_state;
         end
     end
 endtask
+
+always @(*) begin
+    if (!rst_n) begin
+        zero_state();
+    end
+end
 
 endmodule

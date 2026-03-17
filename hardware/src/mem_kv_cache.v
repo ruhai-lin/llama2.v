@@ -4,7 +4,9 @@ module mem_kv_cache #(
     parameter N_HEADS = 8,
     parameter N_KV_HEADS = 4,
     parameter MAX_SEQ_LEN = 512
-) ();
+) (
+    input wire rst_n
+);
 
 localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
 
@@ -21,5 +23,11 @@ task zero_cache;
         end
     end
 endtask
+
+always @(*) begin
+    if (!rst_n) begin
+        zero_cache();
+    end
+end
 
 endmodule

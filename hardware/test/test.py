@@ -169,7 +169,7 @@ async def write_memory_array(memory_handle, values, chunk_size=2048):
 
 
 async def load_model_weights(dut, weights):
-    mem = dut.u_block.u_mem_weights
+    mem = dut.u_mem_weights
     await write_memory_array(mem.token_embedding_bits, weights["token_embedding"])
     await write_memory_array(mem.rms_att_bits, weights["rms_att"])
     await write_memory_array(mem.wq_bits, weights["wq"])

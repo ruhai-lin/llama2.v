@@ -1,127 +1,170 @@
 module transformer_block #(
-    parameter VOCAB_SIZE = 512,
-    parameter TOKEN_W = 9,
-    parameter LOGIT_W = 32,
-    parameter LOGITS_W = VOCAB_SIZE * LOGIT_W,
     parameter DIM = 64,
     parameter HIDDEN_DIM = 172,
-    parameter N_LAYERS = 5,
     parameter N_HEADS = 8,
     parameter N_KV_HEADS = 4,
     parameter MAX_SEQ_LEN = 512
-) ();
+) (
+    input wire clk,
+    input wire rst_n,
+    input wire start,
+    input wire [2:0] layer_idx,
+    input wire [9:0] pos_idx,
+    input wire [31:0] block_input_base_addr,
+    input wire [31:0] block_output_base_addr,
+    output wire busy,
+    output reg done
+);
 
-mem_weights #(
-    .VOCAB_SIZE(VOCAB_SIZE),
-    .DIM(DIM),
-    .HIDDEN_DIM(HIDDEN_DIM),
-    .N_LAYERS(N_LAYERS),
-    .N_HEADS(N_HEADS),
-    .N_KV_HEADS(N_KV_HEADS)
-) u_mem_weights ();
+localparam STATE_IDLE       = 3'd0;
+localparam STATE_ATTN_START = 3'd1;
+localparam STATE_ATTN_WAIT  = 3'd2;
+localparam STATE_FFN_START  = 3'd3;
+localparam STATE_FFN_WAIT   = 3'd4;
+localparam STATE_DONE       = 3'd5;
+localparam VOCAB_SIZE = 512;
+localparam N_LAYERS = 5;
 
-mem_activation #(
-    .VOCAB_SIZE(VOCAB_SIZE),
-    .DIM(DIM),
-    .HIDDEN_DIM(HIDDEN_DIM),
-    .N_HEADS(N_HEADS),
-    .MAX_SEQ_LEN(MAX_SEQ_LEN),
-    .N_KV_HEADS(N_KV_HEADS)
-) u_mem_activation ();
+reg [2:0] state;
 
-mem_kv_cache #(
-    .DIM(DIM),
-    .N_LAYERS(N_LAYERS),
-    .N_HEADS(N_HEADS),
-    .N_KV_HEADS(N_KV_HEADS),
-    .MAX_SEQ_LEN(MAX_SEQ_LEN)
-) u_mem_kv_cache ();
+wire attn_start;
+wire attn_busy;
+wire attn_done;
+wire attn_kv_rd_en;
+wire [31:0] attn_kv_rd_addr;
+wire [63:0] attn_kv_rd_data;
+wire attn_kv_wr_en;
+wire [31:0] attn_kv_wr_addr;
+wire [63:0] attn_kv_wr_data;
+wire ffn_start;
+wire ffn_busy;
+wire ffn_done;
+
+localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
+
+`include "memory_map.vh"
+
+function [63:0] kv_read_bits;
+    input [31:0] addr;
+    begin
+        if (addr < `KV_CACHE_SIZE) begin
+            kv_read_bits = $realtobits(top_level_module.u_mem_kv_cache.key_cache[addr]);
+        end else begin
+            kv_read_bits = $realtobits(top_level_module.u_mem_kv_cache.value_cache[addr - `KV_CACHE_SIZE]);
+        end
+    end
+endfunction
+
+task read_kv_local;
+    input integer addr;
+    output real value;
+    begin
+        value = $bitstoreal(kv_read_bits(addr));
+    end
+endtask
+
+task write_kv_local;
+    input integer addr;
+    input real value;
+    begin
+        if (addr < `KV_CACHE_SIZE) begin
+            top_level_module.u_mem_kv_cache.key_cache[addr] = value;
+        end else begin
+            top_level_module.u_mem_kv_cache.value_cache[addr - `KV_CACHE_SIZE] = value;
+        end
+    end
+endtask
+
+assign attn_kv_rd_data = kv_read_bits(attn_kv_rd_addr);
+
+always @(*) begin
+    if (attn_kv_wr_en) begin
+        write_kv_local(attn_kv_wr_addr, $bitstoreal(attn_kv_wr_data));
+    end
+end
+
+assign busy = (state != STATE_IDLE);
+assign attn_start = (state == STATE_ATTN_START);
+assign ffn_start = (state == STATE_FFN_START);
 
 attn #(
     .DIM(DIM),
     .N_HEADS(N_HEADS),
     .N_KV_HEADS(N_KV_HEADS),
     .MAX_SEQ_LEN(MAX_SEQ_LEN)
-) u_attn ();
+) u_attn (
+    .clk(clk),
+    .rst_n(rst_n),
+    .start(attn_start),
+    .layer_idx(layer_idx),
+    .pos_idx(pos_idx),
+    .kv_rd_en(attn_kv_rd_en),
+    .kv_rd_addr(attn_kv_rd_addr),
+    .kv_rd_data(attn_kv_rd_data),
+    .kv_wr_en(attn_kv_wr_en),
+    .kv_wr_addr(attn_kv_wr_addr),
+    .kv_wr_data(attn_kv_wr_data),
+    .busy(attn_busy),
+    .done(attn_done)
+);
 
 ffn #(
     .DIM(DIM),
     .HIDDEN_DIM(HIDDEN_DIM),
     .N_HEADS(N_HEADS),
     .N_KV_HEADS(N_KV_HEADS)
-) u_ffn ();
+) u_ffn (
+    .clk(clk),
+    .rst_n(rst_n),
+    .start(ffn_start),
+    .layer_idx(layer_idx),
+    .busy(ffn_busy),
+    .done(ffn_done)
+);
 
-kernel_rmsnorm #(
-    .DIM(DIM)
-) u_final_rms ();
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        state <= STATE_IDLE;
+        done <= 1'b0;
+    end else begin
+        done <= 1'b0;
+        case (state)
+            STATE_IDLE: begin
+                if (start) begin
+                    state <= STATE_ATTN_START;
+                end
+            end
 
-kernel_matmul #(
-    .VOCAB_SIZE(VOCAB_SIZE),
-    .TOKEN_W(TOKEN_W),
-    .LOGIT_W(LOGIT_W),
-    .LOGITS_W(LOGITS_W),
-    .DIM(DIM),
-    .HIDDEN_DIM(HIDDEN_DIM),
-    .N_LAYERS(N_LAYERS),
-    .N_HEADS(N_HEADS),
-    .N_KV_HEADS(N_KV_HEADS)
-) u_cls_matmul ();
+            STATE_ATTN_START: begin
+                state <= STATE_ATTN_WAIT;
+            end
 
-integer i;
-reg initialized;
+            STATE_ATTN_WAIT: begin
+                if (attn_done) begin
+                    state <= STATE_FFN_START;
+                end
+            end
 
-task sync_weights;
-    begin
-        if (!u_mem_weights.synced) begin
-            u_mem_weights.sync_from_bits();
-        end
-        initialized = 1'b1;
+            STATE_FFN_START: begin
+                state <= STATE_FFN_WAIT;
+            end
+
+            STATE_FFN_WAIT: begin
+                if (ffn_done) begin
+                    state <= STATE_DONE;
+                end
+            end
+
+            STATE_DONE: begin
+                done <= 1'b1;
+                state <= STATE_IDLE;
+            end
+
+            default: begin
+                state <= STATE_IDLE;
+            end
+        endcase
     end
-endtask
-
-task zero_state;
-    begin
-        u_mem_activation.zero_state();
-        u_mem_kv_cache.zero_cache();
-    end
-endtask
-
-task load_embedding;
-    input integer token_id;
-    integer base_idx;
-    begin
-        base_idx = token_id * DIM;
-        for (i = 0; i < DIM; i = i + 1) begin
-            u_mem_activation.x[i] = u_mem_weights.token_embedding[base_idx + i];
-        end
-    end
-endtask
-
-task run_layer;
-    input integer layer_idx;
-    input integer pos_idx;
-    begin
-        u_attn.run(layer_idx, pos_idx);
-        u_ffn.run(layer_idx);
-    end
-endtask
-
-task final_rmsnorm;
-    begin
-        u_final_rms.apply_final();
-    end
-endtask
-
-task classify_and_argmax;
-    output [TOKEN_W-1:0] next_token;
-    output [LOGITS_W-1:0] flat_logits;
-    begin
-        u_cls_matmul.classify(next_token, flat_logits);
-    end
-endtask
-
-initial begin
-    initialized = 1'b0;
 end
 
 endmodule
