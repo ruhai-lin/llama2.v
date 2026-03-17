@@ -6,52 +6,46 @@ module mem_activation #(
     parameter MAX_SEQ_LEN = 512,
     parameter N_KV_HEADS = 4
 ) (
-    input wire rst_n
+    input wire clk,
+    input wire rst_n,
+    input wire rd_en,
+    input wire [31:0] rd_addr,
+    output reg [31:0] rd_data,
+    input wire wr_en,
+    input wire [31:0] wr_addr,
+    input wire [31:0] wr_data
 );
 
 localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
 
-real x [0:DIM-1];
-real xb [0:DIM-1];
-real xb2 [0:DIM-1];
-real hb [0:HIDDEN_DIM-1];
-real hb2 [0:HIDDEN_DIM-1];
-real q [0:DIM-1];
-real k_vec [0:KV_DIM-1];
-real v_vec [0:KV_DIM-1];
-real att [0:N_HEADS*MAX_SEQ_LEN-1];
-real logits_real [0:VOCAB_SIZE-1];
+`include "memory_map.vh"
 
-integer idx;
+localparam DEPTH = `ACT_LOGITS_BASE + `ACT_LOGITS_SIZE;
 
-task zero_state;
-    begin
-        for (idx = 0; idx < DIM; idx = idx + 1) begin
-            x[idx] = 0.0;
-            xb[idx] = 0.0;
-            xb2[idx] = 0.0;
-            q[idx] = 0.0;
-        end
-        for (idx = 0; idx < HIDDEN_DIM; idx = idx + 1) begin
-            hb[idx] = 0.0;
-            hb2[idx] = 0.0;
-        end
-        for (idx = 0; idx < KV_DIM; idx = idx + 1) begin
-            k_vec[idx] = 0.0;
-            v_vec[idx] = 0.0;
-        end
-        for (idx = 0; idx < N_HEADS * MAX_SEQ_LEN; idx = idx + 1) begin
-            att[idx] = 0.0;
-        end
-        for (idx = 0; idx < VOCAB_SIZE; idx = idx + 1) begin
-            logits_real[idx] = 0.0;
-        end
-    end
-endtask
+reg [31:0] mem [0:DEPTH-1];
+reg [31:0] tag [0:DEPTH-1];
+reg [31:0] epoch;
 
-always @(*) begin
+initial begin
+    epoch = 32'd1;
+    rd_data = 32'd0;
+end
+
+always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        zero_state();
+        epoch <= epoch + 32'd1;
+        rd_data <= 32'd0;
+    end else begin
+        if (wr_en && (wr_addr < DEPTH)) begin
+            mem[wr_addr] <= wr_data;
+            tag[wr_addr] <= epoch;
+        end
+
+        if (rd_en && (rd_addr < DEPTH) && (tag[rd_addr] == epoch)) begin
+            rd_data <= mem[rd_addr];
+        end else begin
+            rd_data <= 32'd0;
+        end
     end
 end
 

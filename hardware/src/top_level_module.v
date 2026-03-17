@@ -23,6 +23,8 @@ module top_level_module #(
     output wire busy
 );
 
+`include "real_fp32_helpers.vh"
+
 localparam FSM_IDLE            = 4'd0;
 localparam FSM_EMBED           = 4'd1;
 localparam FSM_BLOCK_START     = 4'd2;
@@ -45,6 +47,10 @@ reg weights_initialized;
 integer embed_idx;
 integer embed_base_idx;
 real embed_value;
+reg local_act_wr_en;
+reg [31:0] local_act_wr_addr;
+reg [31:0] local_act_wr_data;
+reg embed_done_reg;
 
 wire [3:0] fsm_state;
 wire [2:0] fsm_layer_idx;
@@ -70,36 +76,48 @@ wire [LOGITS_W-1:0] cls_logits;
 
 wire final_act_rd_en;
 wire [31:0] final_act_rd_addr;
-wire [63:0] final_act_rd_data;
+wire [31:0] final_act_rd_data;
 wire final_act_wr_en;
 wire [31:0] final_act_wr_addr;
-wire [63:0] final_act_wr_data;
+wire [31:0] final_act_wr_data;
 wire final_wgt_rd_en;
 wire [31:0] final_wgt_rd_addr;
 wire [63:0] final_wgt_rd_data;
 
 wire cls_act_rd_en;
 wire [31:0] cls_act_rd_addr;
-wire [63:0] cls_act_rd_data;
+wire [31:0] cls_act_rd_data;
 wire cls_act_wr_en;
 wire [31:0] cls_act_wr_addr;
-wire [63:0] cls_act_wr_data;
+wire [31:0] cls_act_wr_data;
 wire cls_wgt_rd_en;
 wire [31:0] cls_wgt_rd_addr;
 wire [63:0] cls_wgt_rd_data;
 
-function [63:0] act_read_bits;
-    input [31:0] addr;
-    begin
-        if (addr < DIM) begin
-            act_read_bits = $realtobits(u_mem_activation.x[addr]);
-        end else if (addr >= `ACT_LOGITS_BASE) begin
-            act_read_bits = $realtobits(u_mem_activation.logits_real[addr - `ACT_LOGITS_BASE]);
-        end else begin
-            act_read_bits = 64'd0;
-        end
-    end
-endfunction
+wire block_act_rd_en;
+wire [31:0] block_act_rd_addr;
+wire [31:0] block_act_rd_data;
+wire block_act_wr_en;
+wire [31:0] block_act_wr_addr;
+wire [31:0] block_act_wr_data;
+wire block_kv_rd_en;
+wire [31:0] block_kv_rd_addr;
+wire [31:0] block_kv_rd_data;
+wire block_kv_wr_en;
+wire [31:0] block_kv_wr_addr;
+wire [31:0] block_kv_wr_data;
+reg mem_act_rd_en;
+reg [31:0] mem_act_rd_addr;
+wire [31:0] mem_act_rd_data;
+reg mem_act_wr_en;
+reg [31:0] mem_act_wr_addr;
+reg [31:0] mem_act_wr_data;
+reg mem_kv_rd_en;
+reg [31:0] mem_kv_rd_addr;
+wire [31:0] mem_kv_rd_data;
+reg mem_kv_wr_en;
+reg [31:0] mem_kv_wr_addr;
+reg [31:0] mem_kv_wr_data;
 
 function [63:0] final_wgt_read_bits;
     input [31:0] addr;
@@ -119,11 +137,11 @@ task write_act_local;
     input integer addr;
     input real value;
     begin
-        if (addr >= `ACT_X_BASE && addr < `ACT_X_BASE + `ACT_X_SIZE) begin
-            u_mem_activation.x[addr - `ACT_X_BASE] = value;
-        end else if (addr >= `ACT_LOGITS_BASE && addr < `ACT_LOGITS_BASE + `ACT_LOGITS_SIZE) begin
-            u_mem_activation.logits_real[addr - `ACT_LOGITS_BASE] = value;
-        end
+        local_act_wr_addr = addr;
+        local_act_wr_data = real_to_fp32_bits(value);
+        local_act_wr_en = 1'b1;
+        @(posedge clk);
+        local_act_wr_en = 1'b0;
     end
 endtask
 
@@ -140,23 +158,72 @@ assign in_ready = fsm_in_ready;
 assign busy = fsm_busy;
 assign out_valid = fsm_out_valid;
 assign logits_valid = fsm_out_valid;
-assign embed_done = (fsm_state == FSM_EMBED) && weights_initialized;
+assign embed_done = embed_done_reg;
 assign block_start = (fsm_state == FSM_BLOCK_START);
 assign final_rms_start = (fsm_state == FSM_FINAL_RMS_START);
 assign cls_start = (fsm_state == FSM_CLS_START);
 assign weights_sync_start = start_step && !weights_initialized;
-assign final_act_rd_data = act_read_bits(final_act_rd_addr);
-assign cls_act_rd_data = act_read_bits(cls_act_rd_addr);
+assign final_act_rd_data = mem_act_rd_data;
+assign cls_act_rd_data = mem_act_rd_data;
+assign block_act_rd_data = mem_act_rd_data;
+assign block_kv_rd_data = mem_kv_rd_data;
 assign final_wgt_rd_data = final_wgt_read_bits(final_wgt_rd_addr);
 assign cls_wgt_rd_data = cls_wgt_read_bits(cls_wgt_rd_addr);
 
 always @(*) begin
-    if (final_act_wr_en) begin
-        write_act_local(final_act_wr_addr, $bitstoreal(final_act_wr_data));
-    end
-    if (cls_act_wr_en) begin
-        write_act_local(cls_act_wr_addr, $bitstoreal(cls_act_wr_data));
-    end
+    mem_act_rd_en = 1'b0;
+    mem_act_rd_addr = 32'd0;
+    mem_act_wr_en = 1'b0;
+    mem_act_wr_addr = 32'd0;
+    mem_act_wr_data = 32'd0;
+    mem_kv_rd_en = 1'b0;
+    mem_kv_rd_addr = 32'd0;
+    mem_kv_wr_en = 1'b0;
+    mem_kv_wr_addr = 32'd0;
+    mem_kv_wr_data = 32'd0;
+
+    case (fsm_state)
+        FSM_EMBED: begin
+            mem_act_wr_en = local_act_wr_en;
+            mem_act_wr_addr = local_act_wr_addr;
+            mem_act_wr_data = local_act_wr_data;
+        end
+
+        FSM_BLOCK_START,
+        FSM_BLOCK_WAIT: begin
+            mem_act_rd_en = block_act_rd_en;
+            mem_act_rd_addr = block_act_rd_addr;
+            mem_act_wr_en = block_act_wr_en;
+            mem_act_wr_addr = block_act_wr_addr;
+            mem_act_wr_data = block_act_wr_data;
+            mem_kv_rd_en = block_kv_rd_en;
+            mem_kv_rd_addr = block_kv_rd_addr;
+            mem_kv_wr_en = block_kv_wr_en;
+            mem_kv_wr_addr = block_kv_wr_addr;
+            mem_kv_wr_data = block_kv_wr_data;
+        end
+
+        FSM_FINAL_RMS_START,
+        FSM_FINAL_RMS_WAIT: begin
+            mem_act_rd_en = final_act_rd_en;
+            mem_act_rd_addr = final_act_rd_addr;
+            mem_act_wr_en = final_act_wr_en;
+            mem_act_wr_addr = final_act_wr_addr;
+            mem_act_wr_data = final_act_wr_data;
+        end
+
+        FSM_CLS_START,
+        FSM_CLS_WAIT: begin
+            mem_act_rd_en = cls_act_rd_en;
+            mem_act_rd_addr = cls_act_rd_addr;
+            mem_act_wr_en = cls_act_wr_en;
+            mem_act_wr_addr = cls_act_wr_addr;
+            mem_act_wr_data = cls_act_wr_data;
+        end
+
+        default: begin
+        end
+    endcase
 end
 
 fsm #(
@@ -199,7 +266,14 @@ mem_activation #(
     .MAX_SEQ_LEN(MAX_SEQ_LEN),
     .N_KV_HEADS(N_KV_HEADS)
 ) u_mem_activation (
-    .rst_n(rst_n)
+    .clk(clk),
+    .rst_n(rst_n),
+    .rd_en(mem_act_rd_en),
+    .rd_addr(mem_act_rd_addr),
+    .rd_data(mem_act_rd_data),
+    .wr_en(mem_act_wr_en),
+    .wr_addr(mem_act_wr_addr),
+    .wr_data(mem_act_wr_data)
 );
 
 mem_kv_cache #(
@@ -209,7 +283,14 @@ mem_kv_cache #(
     .N_KV_HEADS(N_KV_HEADS),
     .MAX_SEQ_LEN(MAX_SEQ_LEN)
 ) u_mem_kv_cache (
-    .rst_n(rst_n)
+    .clk(clk),
+    .rst_n(rst_n),
+    .rd_en(mem_kv_rd_en),
+    .rd_addr(mem_kv_rd_addr),
+    .rd_data(mem_kv_rd_data),
+    .wr_en(mem_kv_wr_en),
+    .wr_addr(mem_kv_wr_addr),
+    .wr_data(mem_kv_wr_data)
 );
 
 transformer_block #(
@@ -226,6 +307,18 @@ transformer_block #(
     .pos_idx(current_pos),
     .block_input_base_addr(32'd0),
     .block_output_base_addr(32'd0),
+    .act_rd_en(block_act_rd_en),
+    .act_rd_addr(block_act_rd_addr),
+    .act_rd_data(block_act_rd_data),
+    .act_wr_en(block_act_wr_en),
+    .act_wr_addr(block_act_wr_addr),
+    .act_wr_data(block_act_wr_data),
+    .kv_rd_en(block_kv_rd_en),
+    .kv_rd_addr(block_kv_rd_addr),
+    .kv_rd_data(block_kv_rd_data),
+    .kv_wr_en(block_kv_wr_en),
+    .kv_wr_addr(block_kv_wr_addr),
+    .kv_wr_data(block_kv_wr_data),
     .busy(block_busy),
     .done(block_done)
 );
@@ -291,7 +384,13 @@ always @(posedge clk or negedge rst_n) begin
         weights_initialized <= 1'b0;
         next_token_id <= {TOKEN_W{1'b0}};
         logits <= {LOGITS_W{1'b0}};
+        local_act_wr_en <= 1'b0;
+        local_act_wr_addr <= 32'd0;
+        local_act_wr_data <= 32'd0;
+        embed_done_reg <= 1'b0;
     end else begin
+        embed_done_reg <= 1'b0;
+
         if (weights_sync_done) begin
             weights_initialized <= 1'b1;
         end
@@ -301,12 +400,13 @@ always @(posedge clk or negedge rst_n) begin
             current_pos <= seq_pos;
         end
 
-        if (fsm_state == FSM_EMBED && weights_initialized) begin
+        if (fsm_state == FSM_EMBED && weights_initialized && !embed_done_reg) begin
             embed_base_idx = current_token_id * DIM;
             for (embed_idx = 0; embed_idx < DIM; embed_idx = embed_idx + 1) begin
                 read_wgt_local(`WGT_TOKEN_EMBED_BASE + embed_base_idx + embed_idx, embed_value);
                 write_act_local(`ACT_X_BASE + embed_idx, embed_value);
             end
+            embed_done_reg <= 1'b1;
         end
 
         if (cls_done) begin

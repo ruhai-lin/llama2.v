@@ -3,12 +3,13 @@ module kernel_softmax #(
     parameter MAX_SEQ_LEN = 512,
     parameter ACT_ATT_BASE = 0
 ) (
+    input wire clk,
     output reg act_rd_en,
     output reg [31:0] act_rd_addr,
-    input wire [63:0] act_rd_data,
+    input wire [31:0] act_rd_data,
     output reg act_wr_en,
     output reg [31:0] act_wr_addr,
-    output reg [63:0] act_wr_data
+    output reg [31:0] act_wr_data
 );
 
 `include "real_fp32_helpers.vh"
@@ -22,11 +23,12 @@ task read_act;
     input integer addr;
     output real value;
     begin
-        act_rd_en = 1'b1;
         act_rd_addr = addr;
-        #0;
-        value = $bitstoreal(act_rd_data);
+        act_rd_en = 1'b1;
+        @(posedge clk);
         act_rd_en = 1'b0;
+        @(negedge clk);
+        value = fp32_to_real(act_rd_data);
     end
 endtask
 
@@ -34,10 +36,10 @@ task write_act;
     input integer addr;
     input real value;
     begin
-        act_wr_en = 1'b1;
         act_wr_addr = addr;
-        act_wr_data = $realtobits(value);
-        #0;
+        act_wr_data = real_to_fp32_bits(value);
+        act_wr_en = 1'b1;
+        @(posedge clk);
         act_wr_en = 1'b0;
     end
 endtask
@@ -70,5 +72,13 @@ task normalize_head;
         end
     end
 endtask
+
+initial begin
+    act_rd_en = 1'b0;
+    act_rd_addr = 32'd0;
+    act_wr_en = 1'b0;
+    act_wr_addr = 32'd0;
+    act_wr_data = 32'd0;
+end
 
 endmodule

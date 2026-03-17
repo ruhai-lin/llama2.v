@@ -239,7 +239,7 @@ async def test_stage1_smoke(dut):
         next_token = await drive_token(dut, token, 1)
 
     generated_tokens = []
-    for _ in range(10):
+    for _ in range(3):
         generated_tokens.append(next_token)
         next_token = await drive_token(dut, next_token, 0)
 

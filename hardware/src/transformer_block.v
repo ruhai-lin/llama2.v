@@ -12,6 +12,18 @@ module transformer_block #(
     input wire [9:0] pos_idx,
     input wire [31:0] block_input_base_addr,
     input wire [31:0] block_output_base_addr,
+    output reg act_rd_en,
+    output reg [31:0] act_rd_addr,
+    input wire [31:0] act_rd_data,
+    output reg act_wr_en,
+    output reg [31:0] act_wr_addr,
+    output reg [31:0] act_wr_data,
+    output reg kv_rd_en,
+    output reg [31:0] kv_rd_addr,
+    input wire [31:0] kv_rd_data,
+    output reg kv_wr_en,
+    output reg [31:0] kv_wr_addr,
+    output reg [31:0] kv_wr_data,
     output wire busy,
     output reg done
 );
@@ -30,62 +42,72 @@ reg [2:0] state;
 wire attn_start;
 wire attn_busy;
 wire attn_done;
+wire attn_act_rd_en;
+wire [31:0] attn_act_rd_addr;
+wire attn_act_wr_en;
+wire [31:0] attn_act_wr_addr;
+wire [31:0] attn_act_wr_data;
 wire attn_kv_rd_en;
 wire [31:0] attn_kv_rd_addr;
-wire [63:0] attn_kv_rd_data;
+wire [31:0] attn_kv_rd_data;
 wire attn_kv_wr_en;
 wire [31:0] attn_kv_wr_addr;
-wire [63:0] attn_kv_wr_data;
+wire [31:0] attn_kv_wr_data;
 wire ffn_start;
 wire ffn_busy;
 wire ffn_done;
+wire ffn_act_rd_en;
+wire [31:0] ffn_act_rd_addr;
+wire ffn_act_wr_en;
+wire [31:0] ffn_act_wr_addr;
+wire [31:0] ffn_act_wr_data;
 
-localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
-
-`include "memory_map.vh"
-
-function [63:0] kv_read_bits;
-    input [31:0] addr;
-    begin
-        if (addr < `KV_CACHE_SIZE) begin
-            kv_read_bits = $realtobits(top_level_module.u_mem_kv_cache.key_cache[addr]);
-        end else begin
-            kv_read_bits = $realtobits(top_level_module.u_mem_kv_cache.value_cache[addr - `KV_CACHE_SIZE]);
-        end
-    end
-endfunction
-
-task read_kv_local;
-    input integer addr;
-    output real value;
-    begin
-        value = $bitstoreal(kv_read_bits(addr));
-    end
-endtask
-
-task write_kv_local;
-    input integer addr;
-    input real value;
-    begin
-        if (addr < `KV_CACHE_SIZE) begin
-            top_level_module.u_mem_kv_cache.key_cache[addr] = value;
-        end else begin
-            top_level_module.u_mem_kv_cache.value_cache[addr - `KV_CACHE_SIZE] = value;
-        end
-    end
-endtask
-
-assign attn_kv_rd_data = kv_read_bits(attn_kv_rd_addr);
-
-always @(*) begin
-    if (attn_kv_wr_en) begin
-        write_kv_local(attn_kv_wr_addr, $bitstoreal(attn_kv_wr_data));
-    end
-end
+assign attn_kv_rd_data = kv_rd_data;
 
 assign busy = (state != STATE_IDLE);
 assign attn_start = (state == STATE_ATTN_START);
 assign ffn_start = (state == STATE_FFN_START);
+
+always @(*) begin
+    act_rd_en = 1'b0;
+    act_rd_addr = 32'd0;
+    act_wr_en = 1'b0;
+    act_wr_addr = 32'd0;
+    act_wr_data = 32'd0;
+    kv_rd_en = 1'b0;
+    kv_rd_addr = 32'd0;
+    kv_wr_en = 1'b0;
+    kv_wr_addr = 32'd0;
+    kv_wr_data = 32'd0;
+
+    case (state)
+        STATE_ATTN_START,
+        STATE_ATTN_WAIT: begin
+            act_rd_en = attn_act_rd_en;
+            act_rd_addr = attn_act_rd_addr;
+            act_wr_en = attn_act_wr_en;
+            act_wr_addr = attn_act_wr_addr;
+            act_wr_data = attn_act_wr_data;
+            kv_rd_en = attn_kv_rd_en;
+            kv_rd_addr = attn_kv_rd_addr;
+            kv_wr_en = attn_kv_wr_en;
+            kv_wr_addr = attn_kv_wr_addr;
+            kv_wr_data = attn_kv_wr_data;
+        end
+
+        STATE_FFN_START,
+        STATE_FFN_WAIT: begin
+            act_rd_en = ffn_act_rd_en;
+            act_rd_addr = ffn_act_rd_addr;
+            act_wr_en = ffn_act_wr_en;
+            act_wr_addr = ffn_act_wr_addr;
+            act_wr_data = ffn_act_wr_data;
+        end
+
+        default: begin
+        end
+    endcase
+end
 
 attn #(
     .DIM(DIM),
@@ -98,6 +120,12 @@ attn #(
     .start(attn_start),
     .layer_idx(layer_idx),
     .pos_idx(pos_idx),
+    .act_rd_en(attn_act_rd_en),
+    .act_rd_addr(attn_act_rd_addr),
+    .act_rd_data(act_rd_data),
+    .act_wr_en(attn_act_wr_en),
+    .act_wr_addr(attn_act_wr_addr),
+    .act_wr_data(attn_act_wr_data),
     .kv_rd_en(attn_kv_rd_en),
     .kv_rd_addr(attn_kv_rd_addr),
     .kv_rd_data(attn_kv_rd_data),
@@ -118,6 +146,12 @@ ffn #(
     .rst_n(rst_n),
     .start(ffn_start),
     .layer_idx(layer_idx),
+    .act_rd_en(ffn_act_rd_en),
+    .act_rd_addr(ffn_act_rd_addr),
+    .act_rd_data(act_rd_data),
+    .act_wr_en(ffn_act_wr_en),
+    .act_wr_addr(ffn_act_wr_addr),
+    .act_wr_data(ffn_act_wr_data),
     .busy(ffn_busy),
     .done(ffn_done)
 );

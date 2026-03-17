@@ -10,10 +10,10 @@ module kernel_rmsnorm #(
     output reg done,
     output reg act_rd_en,
     output reg [31:0] act_rd_addr,
-    input wire [63:0] act_rd_data,
+    input wire [31:0] act_rd_data,
     output reg act_wr_en,
     output reg [31:0] act_wr_addr,
-    output reg [63:0] act_wr_data,
+    output reg [31:0] act_wr_data,
     output reg wgt_rd_en,
     output reg [31:0] wgt_rd_addr,
     input wire [63:0] wgt_rd_data
@@ -31,11 +31,12 @@ task read_act;
     input integer addr;
     output real value;
     begin
-        act_rd_en = 1'b1;
         act_rd_addr = addr;
-        #0;
-        value = $bitstoreal(act_rd_data);
+        act_rd_en = 1'b1;
+        @(posedge clk);
         act_rd_en = 1'b0;
+        @(negedge clk);
+        value = fp32_to_real(act_rd_data);
     end
 endtask
 
@@ -43,10 +44,10 @@ task write_act;
     input integer addr;
     input real value;
     begin
-        act_wr_en = 1'b1;
         act_wr_addr = addr;
-        act_wr_data = $realtobits(value);
-        #0;
+        act_wr_data = real_to_fp32_bits(value);
+        act_wr_en = 1'b1;
+        @(posedge clk);
         act_wr_en = 1'b0;
     end
 endtask
@@ -137,14 +138,11 @@ always @(posedge clk or negedge rst_n) begin
         act_rd_addr <= 32'd0;
         act_wr_en <= 1'b0;
         act_wr_addr <= 32'd0;
-        act_wr_data <= 64'd0;
+        act_wr_data <= 32'd0;
         wgt_rd_en <= 1'b0;
         wgt_rd_addr <= 32'd0;
     end else begin
         done <= 1'b0;
-        act_rd_en <= 1'b0;
-        act_wr_en <= 1'b0;
-        wgt_rd_en <= 1'b0;
         if (start) begin
             busy <= 1'b1;
             if (CONTROL_MODE == 2) begin
