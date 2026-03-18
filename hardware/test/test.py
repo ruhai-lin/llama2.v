@@ -170,17 +170,20 @@ async def write_memory_array(memory_handle, values, chunk_size=2048):
 
 async def load_model_weights(dut, weights):
     mem = dut.u_mem_weights
-    await write_memory_array(mem.token_embedding_bits, weights["token_embedding"])
-    await write_memory_array(mem.rms_att_bits, weights["rms_att"])
-    await write_memory_array(mem.wq_bits, weights["wq"])
-    await write_memory_array(mem.wk_bits, weights["wk"])
-    await write_memory_array(mem.wv_bits, weights["wv"])
-    await write_memory_array(mem.wo_bits, weights["wo"])
-    await write_memory_array(mem.rms_ffn_bits, weights["rms_ffn"])
-    await write_memory_array(mem.w1_bits, weights["w1"])
-    await write_memory_array(mem.w2_bits, weights["w2"])
-    await write_memory_array(mem.w3_bits, weights["w3"])
-    await write_memory_array(mem.rms_final_bits, weights["rms_final"])
+    flat_weights = (
+        weights["token_embedding"]
+        + weights["rms_att"]
+        + weights["wq"]
+        + weights["wk"]
+        + weights["wv"]
+        + weights["wo"]
+        + weights["rms_ffn"]
+        + weights["w1"]
+        + weights["w2"]
+        + weights["w3"]
+        + weights["rms_final"]
+    )
+    await write_memory_array(mem.mem, flat_weights)
     mem.synced.value = 0
     await Timer(1, units="ps")
 

@@ -51,6 +51,8 @@ reg local_act_wr_en;
 reg [31:0] local_act_wr_addr;
 reg [31:0] local_act_wr_data;
 reg embed_done_reg;
+reg local_wgt_rd_en;
+reg [31:0] local_wgt_rd_addr;
 
 wire [3:0] fsm_state;
 wire [2:0] fsm_layer_idx;
@@ -82,7 +84,7 @@ wire [31:0] final_act_wr_addr;
 wire [31:0] final_act_wr_data;
 wire final_wgt_rd_en;
 wire [31:0] final_wgt_rd_addr;
-wire [63:0] final_wgt_rd_data;
+wire [31:0] final_wgt_rd_data;
 
 wire cls_act_rd_en;
 wire [31:0] cls_act_rd_addr;
@@ -92,7 +94,7 @@ wire [31:0] cls_act_wr_addr;
 wire [31:0] cls_act_wr_data;
 wire cls_wgt_rd_en;
 wire [31:0] cls_wgt_rd_addr;
-wire [63:0] cls_wgt_rd_data;
+wire [31:0] cls_wgt_rd_data;
 
 wire block_act_rd_en;
 wire [31:0] block_act_rd_addr;
@@ -100,6 +102,9 @@ wire [31:0] block_act_rd_data;
 wire block_act_wr_en;
 wire [31:0] block_act_wr_addr;
 wire [31:0] block_act_wr_data;
+wire block_wgt_rd_en;
+wire [31:0] block_wgt_rd_addr;
+wire [31:0] block_wgt_rd_data;
 wire block_kv_rd_en;
 wire [31:0] block_kv_rd_addr;
 wire [31:0] block_kv_rd_data;
@@ -118,20 +123,9 @@ wire [31:0] mem_kv_rd_data;
 reg mem_kv_wr_en;
 reg [31:0] mem_kv_wr_addr;
 reg [31:0] mem_kv_wr_data;
-
-function [63:0] final_wgt_read_bits;
-    input [31:0] addr;
-    begin
-        final_wgt_read_bits = $realtobits(u_mem_weights.rms_final_weight[addr]);
-    end
-endfunction
-
-function [63:0] cls_wgt_read_bits;
-    input [31:0] addr;
-    begin
-        cls_wgt_read_bits = $realtobits(u_mem_weights.token_embedding[addr - `WGT_TOKEN_EMBED_BASE]);
-    end
-endfunction
+reg mem_wgt_rd_en;
+reg [31:0] mem_wgt_rd_addr;
+wire [31:0] mem_wgt_rd_data;
 
 task write_act_local;
     input integer addr;
@@ -149,7 +143,12 @@ task read_wgt_local;
     input integer addr;
     output real value;
     begin
-        value = $bitstoreal(cls_wgt_read_bits(addr));
+        local_wgt_rd_addr = addr;
+        local_wgt_rd_en = 1'b1;
+        @(posedge clk);
+        local_wgt_rd_en = 1'b0;
+        @(negedge clk);
+        value = fp32_to_real(mem_wgt_rd_data);
     end
 endtask
 
@@ -166,9 +165,10 @@ assign weights_sync_start = start_step && !weights_initialized;
 assign final_act_rd_data = mem_act_rd_data;
 assign cls_act_rd_data = mem_act_rd_data;
 assign block_act_rd_data = mem_act_rd_data;
+assign final_wgt_rd_data = mem_wgt_rd_data;
+assign cls_wgt_rd_data = mem_wgt_rd_data;
+assign block_wgt_rd_data = mem_wgt_rd_data;
 assign block_kv_rd_data = mem_kv_rd_data;
-assign final_wgt_rd_data = final_wgt_read_bits(final_wgt_rd_addr);
-assign cls_wgt_rd_data = cls_wgt_read_bits(cls_wgt_rd_addr);
 
 always @(*) begin
     mem_act_rd_en = 1'b0;
@@ -181,12 +181,16 @@ always @(*) begin
     mem_kv_wr_en = 1'b0;
     mem_kv_wr_addr = 32'd0;
     mem_kv_wr_data = 32'd0;
+    mem_wgt_rd_en = 1'b0;
+    mem_wgt_rd_addr = 32'd0;
 
     case (fsm_state)
         FSM_EMBED: begin
             mem_act_wr_en = local_act_wr_en;
             mem_act_wr_addr = local_act_wr_addr;
             mem_act_wr_data = local_act_wr_data;
+            mem_wgt_rd_en = local_wgt_rd_en;
+            mem_wgt_rd_addr = local_wgt_rd_addr;
         end
 
         FSM_BLOCK_START,
@@ -201,6 +205,8 @@ always @(*) begin
             mem_kv_wr_en = block_kv_wr_en;
             mem_kv_wr_addr = block_kv_wr_addr;
             mem_kv_wr_data = block_kv_wr_data;
+            mem_wgt_rd_en = block_wgt_rd_en;
+            mem_wgt_rd_addr = block_wgt_rd_addr;
         end
 
         FSM_FINAL_RMS_START,
@@ -210,6 +216,8 @@ always @(*) begin
             mem_act_wr_en = final_act_wr_en;
             mem_act_wr_addr = final_act_wr_addr;
             mem_act_wr_data = final_act_wr_data;
+            mem_wgt_rd_en = final_wgt_rd_en;
+            mem_wgt_rd_addr = `WGT_RMS_FINAL_BASE + final_wgt_rd_addr;
         end
 
         FSM_CLS_START,
@@ -219,6 +227,8 @@ always @(*) begin
             mem_act_wr_en = cls_act_wr_en;
             mem_act_wr_addr = cls_act_wr_addr;
             mem_act_wr_data = cls_act_wr_data;
+            mem_wgt_rd_en = cls_wgt_rd_en;
+            mem_wgt_rd_addr = cls_wgt_rd_addr;
         end
 
         default: begin
@@ -249,13 +259,17 @@ mem_weights #(
     .HIDDEN_DIM(HIDDEN_DIM),
     .N_LAYERS(N_LAYERS),
     .N_HEADS(N_HEADS),
-    .N_KV_HEADS(N_KV_HEADS)
+    .N_KV_HEADS(N_KV_HEADS),
+    .MAX_SEQ_LEN(MAX_SEQ_LEN)
 ) u_mem_weights (
     .clk(clk),
     .rst_n(rst_n),
     .sync_start(weights_sync_start),
     .busy(weights_sync_busy),
-    .done(weights_sync_done)
+    .done(weights_sync_done),
+    .wgt_rd_en(mem_wgt_rd_en),
+    .wgt_rd_addr(mem_wgt_rd_addr),
+    .wgt_rd_data(mem_wgt_rd_data)
 );
 
 mem_activation #(
@@ -313,6 +327,9 @@ transformer_block #(
     .act_wr_en(block_act_wr_en),
     .act_wr_addr(block_act_wr_addr),
     .act_wr_data(block_act_wr_data),
+    .wgt_rd_en(block_wgt_rd_en),
+    .wgt_rd_addr(block_wgt_rd_addr),
+    .wgt_rd_data(block_wgt_rd_data),
     .kv_rd_en(block_kv_rd_en),
     .kv_rd_addr(block_kv_rd_addr),
     .kv_rd_data(block_kv_rd_data),
@@ -388,6 +405,8 @@ always @(posedge clk or negedge rst_n) begin
         local_act_wr_addr <= 32'd0;
         local_act_wr_data <= 32'd0;
         embed_done_reg <= 1'b0;
+        local_wgt_rd_en <= 1'b0;
+        local_wgt_rd_addr <= 32'd0;
     end else begin
         embed_done_reg <= 1'b0;
 

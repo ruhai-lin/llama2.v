@@ -14,6 +14,9 @@ module ffn #(
     output reg act_wr_en,
     output reg [31:0] act_wr_addr,
     output reg [31:0] act_wr_data,
+    output reg wgt_rd_en,
+    output reg [31:0] wgt_rd_addr,
+    input wire [31:0] wgt_rd_data,
     output reg busy,
     output reg done
 );
@@ -34,7 +37,7 @@ wire [31:0] rms_act_wr_addr;
 wire [31:0] rms_act_wr_data;
 wire rms_wgt_rd_en;
 wire [31:0] rms_wgt_rd_addr;
-wire [63:0] rms_wgt_rd_data;
+wire [31:0] rms_wgt_rd_data;
 
 wire matmul_act_rd_en;
 wire [31:0] matmul_act_rd_addr;
@@ -44,7 +47,7 @@ wire [31:0] matmul_act_wr_addr;
 wire [31:0] matmul_act_wr_data;
 wire matmul_wgt_rd_en;
 wire [31:0] matmul_wgt_rd_addr;
-wire [63:0] matmul_wgt_rd_data;
+wire [31:0] matmul_wgt_rd_data;
 
 reg local_act_rd_en;
 reg [31:0] local_act_rd_addr;
@@ -52,25 +55,10 @@ reg local_act_wr_en;
 reg [31:0] local_act_wr_addr;
 reg [31:0] local_act_wr_data;
 
-function [63:0] wgt_read_bits;
-    input [31:0] addr;
-    begin
-        if (addr < `WGT_W1_BASE) begin
-            wgt_read_bits = $realtobits(top_level_module.u_mem_weights.rms_ffn_weight[addr - `WGT_RMS_FFN_BASE]);
-        end else if (addr < `WGT_W2_BASE) begin
-            wgt_read_bits = $realtobits(top_level_module.u_mem_weights.w1[addr - `WGT_W1_BASE]);
-        end else if (addr < `WGT_W3_BASE) begin
-            wgt_read_bits = $realtobits(top_level_module.u_mem_weights.w2[addr - `WGT_W2_BASE]);
-        end else begin
-            wgt_read_bits = $realtobits(top_level_module.u_mem_weights.w3[addr - `WGT_W3_BASE]);
-        end
-    end
-endfunction
-
 assign rms_act_rd_data = act_rd_data;
 assign matmul_act_rd_data = act_rd_data;
-assign rms_wgt_rd_data = $realtobits(top_level_module.u_mem_weights.rms_ffn_weight[rms_wgt_rd_addr]);
-assign matmul_wgt_rd_data = wgt_read_bits(matmul_wgt_rd_addr);
+assign rms_wgt_rd_data = wgt_rd_data;
+assign matmul_wgt_rd_data = wgt_rd_data;
 
 always @(*) begin
     act_rd_en = 1'b0;
@@ -78,6 +66,8 @@ always @(*) begin
     act_wr_en = 1'b0;
     act_wr_addr = 32'd0;
     act_wr_data = 32'd0;
+    wgt_rd_en = 1'b0;
+    wgt_rd_addr = 32'd0;
 
     if (local_act_rd_en) begin
         act_rd_en = 1'b1;
@@ -102,6 +92,14 @@ always @(*) begin
         act_wr_en = 1'b1;
         act_wr_addr = rms_act_wr_addr;
         act_wr_data = rms_act_wr_data;
+    end
+
+    if (matmul_wgt_rd_en) begin
+        wgt_rd_en = 1'b1;
+        wgt_rd_addr = matmul_wgt_rd_addr;
+    end else if (rms_wgt_rd_en) begin
+        wgt_rd_en = 1'b1;
+        wgt_rd_addr = `WGT_RMS_FFN_BASE + rms_wgt_rd_addr;
     end
 end
 

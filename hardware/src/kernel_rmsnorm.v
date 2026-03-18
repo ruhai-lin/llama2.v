@@ -16,7 +16,7 @@ module kernel_rmsnorm #(
     output reg [31:0] act_wr_data,
     output reg wgt_rd_en,
     output reg [31:0] wgt_rd_addr,
-    input wire [63:0] wgt_rd_data
+    input wire [31:0] wgt_rd_data
 );
 
 `include "real_fp32_helpers.vh"
@@ -56,11 +56,12 @@ task read_wgt;
     input integer addr;
     output real value;
     begin
-        wgt_rd_en = 1'b1;
         wgt_rd_addr = addr;
-        #0;
-        value = $bitstoreal(wgt_rd_data);
+        wgt_rd_en = 1'b1;
+        @(posedge clk);
         wgt_rd_en = 1'b0;
+        @(negedge clk);
+        value = fp32_to_real(wgt_rd_data);
     end
 endtask
 
