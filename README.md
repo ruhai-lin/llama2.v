@@ -1,38 +1,31 @@
-# Llama-2 RTL Implementation Project
+# llama2.v
 
-This project implements the core inference loop of Llama-2 (from [llama2.c](https://github.com/karpathy/llama2.c) and [Swan](https://github.com/turingmotors/swan)) in **Verilog-2001**, aiming for RTL-level performance and structure, ultimately targeting an end-to-end generation.
+<p align="center">
+  <img src="assets/llama_chip.png" width="300" height="300" alt="Chip Llama">
+</p>
+
+This project aims to implement the core inference loop of [Llama 2](https://ai.meta.com/llama/) in **Verilog-2001** for RTL-level performance and structure, ultimately targeting an end-to-end generation on hardware.
 
 If you like this project, please consider starring ⭐ this repo as it is the easiest and best way to support it.
 
 ## Quick Start
 
-### 1. Set up the Software Reference (Same as llama2.c)
+### Set up the Hardware (RTL) Simulation Environment
 
-Clone and build the software reference:
-
-```bash
-cd software
-./run ../model/stories260K.bin -z ../model/tok512.bin
-```
-
-This will produce the expected output for verification.
-
-### 2. Set up the Hardware (RTL) Simulation
-
-1. Ensure you have **iveriverilog** and **cocotb** installed:
+> Note: Taking opensource toolchain here as example. You may use other simualtion tools (e.g., Cadence Xcelium, Vivado).
+> But please change test/Makefile accrodingly.
 
 ```bash
-# Using pip
 pip install cocotb
 # For Icarus Verilog
 sudo apt-get install iverilog libverilator-dev
 # Or install via your preferred package manager
 ```
 
-2. Run the hardware simulation:
+### Run the hardware simulation:
 
 ```bash
-cd hardware/test
+cd test
 make
 ```
 
@@ -43,11 +36,7 @@ You may also customize the prompt in `test.py` and run:
 ```bash
 make MODULE=generate
 ```
-
-to try your own prompt.
-
-The simulation will take ~5 mins depending on local environment.
----
+to try your own prompt. The simulation will take ~5 mins depending on local environment.
 
 ## Project Structure
 
@@ -81,6 +70,12 @@ The current Verilog implementation uses behavioral code and cannot be synthesize
    - Focus on area efficiency and yield considerations
    - Submit to Tiny Tapeout program (if applicable)
 
+## Reference
+
+This project is inspired by
+- llama2.c [https://github.com/karpathy/llama2.c]
+- swan [https://github.com/turingmotors/swan]
+- taalas HC1 [https://taalas.com/products/]
 
 ## Contributions
 

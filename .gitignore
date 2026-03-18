@@ -1,12 +1,8 @@
-software/runq_debug.c
-software/runq_fused.c
-
-software/requirements.txt
-software/compare_traces.py
+software/
 
 AGENTS.md
 SPEC.md
 
-hardware/test/__pycache__
-hardware/test/sim_build
-hardware/test/results.xml
+test/__pycache__
+test/sim_build
+test/results.xml
