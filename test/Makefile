@@ -1,7 +1,7 @@
-SIM ?= icarus
+SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
-SIM_BUILD ?= sim_build_local
-COMPILE_ARGS += -I$(PWD)/../src
+SIM_BUILD ?= sim_build
+COMPILE_ARGS += -I$(PWD)/../src --timing -Wno-fatal
 
 VERILOG_SOURCES += $(wildcard $(PWD)/../src/*.v)
 

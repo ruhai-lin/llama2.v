@@ -4,6 +4,12 @@ module kernel_softmax #(
     parameter ACT_ATT_BASE = 0
 ) (
     input wire clk,
+    input wire rst_n,
+    input wire start,
+    input wire [31:0] head_idx,
+    input wire [9:0] pos_idx,
+    output reg busy,
+    output reg done,
     output reg act_rd_en,
     output reg [31:0] act_rd_addr,
     input wire [31:0] act_rd_data,
@@ -79,6 +85,30 @@ initial begin
     act_wr_en = 1'b0;
     act_wr_addr = 32'd0;
     act_wr_data = 32'd0;
+    busy = 1'b0;
+    done = 1'b0;
+end
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        act_rd_en <= 1'b0;
+        act_rd_addr <= 32'd0;
+        act_wr_en <= 1'b0;
+        act_wr_addr <= 32'd0;
+        act_wr_data <= 32'd0;
+        busy <= 1'b0;
+        done <= 1'b0;
+    end else begin
+        done <= 1'b0;
+        if (start) begin
+            busy <= 1'b1;
+            normalize_head(head_idx, pos_idx);
+            busy <= 1'b0;
+            done <= 1'b1;
+        end else begin
+            busy <= 1'b0;
+        end
+    end
 end
 
 endmodule

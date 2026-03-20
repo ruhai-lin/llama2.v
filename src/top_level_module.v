@@ -34,6 +34,8 @@ localparam FSM_FINAL_RMS_WAIT  = 4'd5;
 localparam FSM_CLS_START       = 4'd6;
 localparam FSM_CLS_WAIT        = 4'd7;
 localparam FSM_DONE            = 4'd8;
+localparam RMS_OP_FINAL        = 2'd3;
+localparam MATMUL_OP_CLASSIFY  = 3'd5;
 
 localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
 
@@ -348,6 +350,7 @@ kernel_rmsnorm #(
     .rst_n(rst_n),
     .start(final_rms_start),
     .layer_idx(32'd0),
+    .op_code(RMS_OP_FINAL),
     .busy(final_rms_busy),
     .done(final_rms_done),
     .act_rd_en(final_act_rd_en),
@@ -378,6 +381,7 @@ kernel_matmul #(
     .rst_n(rst_n),
     .start(cls_start),
     .layer_idx(32'd0),
+    .op_code(MATMUL_OP_CLASSIFY),
     .busy(cls_busy),
     .done(cls_done),
     .next_token(cls_next_token_id),

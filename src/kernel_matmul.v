@@ -19,6 +19,7 @@ module kernel_matmul #(
     input wire rst_n,
     input wire start,
     input wire [31:0] layer_idx,
+    input wire [2:0] op_code,
     output reg busy,
     output reg done,
     output reg [TOKEN_W-1:0] next_token,
@@ -45,6 +46,11 @@ localparam PHASE_LOAD_X      = 3'd1;
 localparam PHASE_LOAD_W_TILE = 3'd2;
 localparam PHASE_COMPUTE     = 3'd3;
 localparam PHASE_WRITE_C     = 3'd4;
+localparam OP_QKV            = 3'd1;
+localparam OP_ATTN_OUT       = 3'd2;
+localparam OP_W1_W3          = 3'd3;
+localparam OP_W2             = 3'd4;
+localparam OP_CLASSIFY       = 3'd5;
 
 integer i;
 integer j;
@@ -331,8 +337,16 @@ always @(posedge clk or negedge rst_n) begin
         done <= 1'b0;
         if (start) begin
             busy <= 1'b1;
-            if (CONTROL_MODE == 4) begin
+            if ((op_code == OP_CLASSIFY) || (CONTROL_MODE == 4)) begin
                 classify(next_token, flat_logits);
+            end else if (op_code == OP_QKV) begin
+                project_qkv(layer_idx);
+            end else if (op_code == OP_ATTN_OUT) begin
+                project_attention_output(layer_idx);
+            end else if (op_code == OP_W1_W3) begin
+                project_w1_w3(layer_idx);
+            end else if (op_code == OP_W2) begin
+                project_w2(layer_idx);
             end
             phase <= PHASE_IDLE;
             busy <= 1'b0;

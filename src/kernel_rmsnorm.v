@@ -6,6 +6,7 @@ module kernel_rmsnorm #(
     input wire rst_n,
     input wire start,
     input wire [31:0] layer_idx,
+    input wire [1:0] op_code,
     output reg busy,
     output reg done,
     output reg act_rd_en,
@@ -20,6 +21,10 @@ module kernel_rmsnorm #(
 );
 
 `include "real_fp32_helpers.vh"
+
+localparam OP_ATTN  = 2'd1;
+localparam OP_FFN   = 2'd2;
+localparam OP_FINAL = 2'd3;
 
 integer i;
 real sum_sq;
@@ -146,8 +151,12 @@ always @(posedge clk or negedge rst_n) begin
         done <= 1'b0;
         if (start) begin
             busy <= 1'b1;
-            if (CONTROL_MODE == 2) begin
+            if ((op_code == OP_FINAL) || (CONTROL_MODE == 2)) begin
                 apply_final();
+            end else if (op_code == OP_ATTN) begin
+                apply_attn(layer_idx);
+            end else if (op_code == OP_FFN) begin
+                apply_ffn(layer_idx);
             end
             busy <= 1'b0;
             done <= 1'b1;

@@ -7,8 +7,8 @@ from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, Timer
 
 
-MODEL_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "model", "stories260K.bin"))
-TOKENIZER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "model", "tok512.bin"))
+MODEL_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "model", "stories260K.bin"))
+TOKENIZER_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "model", "tok512.bin"))
 PROMPT = "Once upon a time"
 
 class Tokenizer:
@@ -165,7 +165,7 @@ async def write_memory_array(memory_handle, values, chunk_size=2048):
     for idx, value in enumerate(values):
         memory_handle[idx].value = value
         if idx and (idx % chunk_size) == 0:
-            await Timer(1, units="ps")
+            await Timer(1, unit="ps")
 
 
 async def load_model_weights(dut, weights):
@@ -185,7 +185,7 @@ async def load_model_weights(dut, weights):
     )
     await write_memory_array(mem.mem, flat_weights)
     mem.synced.value = 0
-    await Timer(1, units="ps")
+    await Timer(1, unit="ps")
 
 
 async def drive_token(dut, token_id, is_prompt_token):
@@ -227,7 +227,7 @@ async def test_stage1_smoke(dut):
     dut.in_token_id.value = 0
     dut.is_prompt_token.value = 0
 
-    clock = Clock(dut.clk, 10, units="ns")
+    clock = Clock(dut.clk, 10, unit="ns")
     cocotb.start_soon(clock.start())
 
     for _ in range(3):

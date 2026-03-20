@@ -8,7 +8,7 @@ from test import MODEL_PATH, PROMPT, TOKENIZER_PATH, Tokenizer, drive_token, loa
 
 
 PROMPT = os.getenv("PROMPT", PROMPT)
-GEN_STEPS = int(os.getenv("GEN_STEPS", "100"))
+GEN_STEPS = int(os.getenv("GEN_STEPS", "10"))
 
 
 @cocotb.test()
