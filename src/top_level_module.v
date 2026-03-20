@@ -55,6 +55,13 @@ reg [31:0] local_act_wr_data;
 reg embed_done_reg;
 reg local_wgt_rd_en;
 reg [31:0] local_wgt_rd_addr;
+reg [2:0] embed_state;
+localparam EMBED_IDLE   = 3'd0;
+localparam EMBED_WGT_REQ= 3'd1;
+localparam EMBED_WGT_WAIT=3'd2;
+localparam EMBED_WGT_CAP= 3'd3;
+localparam EMBED_ACT_WR = 3'd4;
+localparam EMBED_DONE   = 3'd5;
 
 wire [3:0] fsm_state;
 wire [2:0] fsm_layer_idx;
@@ -128,31 +135,6 @@ reg [31:0] mem_kv_wr_data;
 reg mem_wgt_rd_en;
 reg [31:0] mem_wgt_rd_addr;
 wire [31:0] mem_wgt_rd_data;
-
-task write_act_local;
-    input integer addr;
-    input real value;
-    begin
-        local_act_wr_addr = addr;
-        local_act_wr_data = real_to_fp32_bits(value);
-        local_act_wr_en = 1'b1;
-        @(posedge clk);
-        local_act_wr_en = 1'b0;
-    end
-endtask
-
-task read_wgt_local;
-    input integer addr;
-    output real value;
-    begin
-        local_wgt_rd_addr = addr;
-        local_wgt_rd_en = 1'b1;
-        @(posedge clk);
-        local_wgt_rd_en = 1'b0;
-        @(negedge clk);
-        value = fp32_to_real(mem_wgt_rd_data);
-    end
-endtask
 
 assign start_step = in_valid & fsm_in_ready;
 assign in_ready = fsm_in_ready;
@@ -411,8 +393,14 @@ always @(posedge clk or negedge rst_n) begin
         embed_done_reg <= 1'b0;
         local_wgt_rd_en <= 1'b0;
         local_wgt_rd_addr <= 32'd0;
+        embed_state <= EMBED_IDLE;
+        embed_idx <= 0;
+        embed_base_idx <= 0;
+        embed_value <= 0.0;
     end else begin
         embed_done_reg <= 1'b0;
+        local_act_wr_en <= 1'b0;
+        local_wgt_rd_en <= 1'b0;
 
         if (weights_sync_done) begin
             weights_initialized <= 1'b1;
@@ -423,13 +411,52 @@ always @(posedge clk or negedge rst_n) begin
             current_pos <= seq_pos;
         end
 
-        if (fsm_state == FSM_EMBED && weights_initialized && !embed_done_reg) begin
-            embed_base_idx = current_token_id * DIM;
-            for (embed_idx = 0; embed_idx < DIM; embed_idx = embed_idx + 1) begin
-                read_wgt_local(`WGT_TOKEN_EMBED_BASE + embed_base_idx + embed_idx, embed_value);
-                write_act_local(`ACT_X_BASE + embed_idx, embed_value);
-            end
-            embed_done_reg <= 1'b1;
+        if (fsm_state != FSM_EMBED) begin
+            embed_state <= EMBED_IDLE;
+        end else if (weights_initialized) begin
+            case (embed_state)
+                EMBED_IDLE: begin
+                    embed_base_idx <= current_token_id * DIM;
+                    embed_idx <= 0;
+                    embed_state <= EMBED_WGT_REQ;
+                end
+
+                EMBED_WGT_REQ: begin
+                    local_wgt_rd_en <= 1'b1;
+                    local_wgt_rd_addr <= `WGT_TOKEN_EMBED_BASE + embed_base_idx + embed_idx;
+                    embed_state <= EMBED_WGT_WAIT;
+                end
+
+                EMBED_WGT_WAIT: begin
+                    embed_state <= EMBED_WGT_CAP;
+                end
+
+                EMBED_WGT_CAP: begin
+                    embed_value <= fp32_to_real(mem_wgt_rd_data);
+                    embed_state <= EMBED_ACT_WR;
+                end
+
+                EMBED_ACT_WR: begin
+                    local_act_wr_en <= 1'b1;
+                    local_act_wr_addr <= `ACT_X_BASE + embed_idx;
+                    local_act_wr_data <= real_to_fp32_bits(embed_value);
+                    if (embed_idx == (DIM - 1)) begin
+                        embed_state <= EMBED_DONE;
+                    end else begin
+                        embed_idx <= embed_idx + 1;
+                        embed_state <= EMBED_WGT_REQ;
+                    end
+                end
+
+                EMBED_DONE: begin
+                    embed_done_reg <= 1'b1;
+                    embed_state <= EMBED_IDLE;
+                end
+
+                default: begin
+                    embed_state <= EMBED_IDLE;
+                end
+            endcase
         end
 
         if (cls_done) begin

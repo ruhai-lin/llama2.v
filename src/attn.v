@@ -39,21 +39,46 @@ localparam KV_MUL = N_HEADS / N_KV_HEADS;
 
 `include "memory_map.vh"
 
-localparam STATE_IDLE            = 5'd0;
-localparam STATE_RMS_START       = 5'd1;
-localparam STATE_RMS_WAIT        = 5'd2;
-localparam STATE_QKV_START       = 5'd3;
-localparam STATE_QKV_WAIT        = 5'd4;
-localparam STATE_ROPE_START      = 5'd5;
-localparam STATE_ROPE_WAIT       = 5'd6;
-localparam STATE_KV_COPY         = 5'd7;
-localparam STATE_HEAD_SCORE      = 5'd8;
-localparam STATE_SOFTMAX_START   = 5'd9;
-localparam STATE_SOFTMAX_WAIT    = 5'd10;
-localparam STATE_HEAD_MERGE      = 5'd11;
-localparam STATE_ATTN_OUT_START  = 5'd12;
-localparam STATE_ATTN_OUT_WAIT   = 5'd13;
-localparam STATE_DONE            = 5'd14;
+localparam STATE_IDLE            = 6'd0;
+localparam STATE_RMS_START       = 6'd1;
+localparam STATE_RMS_WAIT        = 6'd2;
+localparam STATE_QKV_START       = 6'd3;
+localparam STATE_QKV_WAIT        = 6'd4;
+localparam STATE_ROPE_START      = 6'd5;
+localparam STATE_ROPE_WAIT       = 6'd6;
+localparam STATE_KV_K_RD_REQ     = 6'd7;
+localparam STATE_KV_K_RD_WAIT    = 6'd8;
+localparam STATE_KV_K_RD_CAP     = 6'd9;
+localparam STATE_KV_K_WR         = 6'd10;
+localparam STATE_KV_V_RD_REQ     = 6'd11;
+localparam STATE_KV_V_RD_WAIT    = 6'd12;
+localparam STATE_KV_V_RD_CAP     = 6'd13;
+localparam STATE_KV_V_WR         = 6'd14;
+localparam STATE_CLEAR_ALL_WR    = 6'd15;
+localparam STATE_HEAD_PREP       = 6'd16;
+localparam STATE_SCORE_Q_REQ     = 6'd17;
+localparam STATE_SCORE_Q_WAIT    = 6'd18;
+localparam STATE_SCORE_Q_CAP     = 6'd19;
+localparam STATE_SCORE_KV_REQ    = 6'd20;
+localparam STATE_SCORE_KV_WAIT   = 6'd21;
+localparam STATE_SCORE_KV_CAP    = 6'd22;
+localparam STATE_SCORE_WRITE     = 6'd23;
+localparam STATE_SOFTMAX_START   = 6'd24;
+localparam STATE_SOFTMAX_WAIT    = 6'd25;
+localparam STATE_CLEAR_HEAD_WR   = 6'd26;
+localparam STATE_MERGE_XB_REQ    = 6'd27;
+localparam STATE_MERGE_XB_WAIT   = 6'd28;
+localparam STATE_MERGE_XB_CAP    = 6'd29;
+localparam STATE_MERGE_ATT_REQ   = 6'd30;
+localparam STATE_MERGE_ATT_WAIT  = 6'd31;
+localparam STATE_MERGE_ATT_CAP   = 6'd32;
+localparam STATE_MERGE_KV_REQ    = 6'd33;
+localparam STATE_MERGE_KV_WAIT   = 6'd34;
+localparam STATE_MERGE_KV_CAP    = 6'd35;
+localparam STATE_MERGE_WRITE     = 6'd36;
+localparam STATE_ATTN_OUT_START  = 6'd37;
+localparam STATE_ATTN_OUT_WAIT   = 6'd38;
+localparam STATE_DONE            = 6'd39;
 
 localparam RMS_OP_ATTN           = 2'd1;
 localparam MATMUL_OP_QKV         = 3'd1;
@@ -106,10 +131,10 @@ reg [31:0] local_act_rd_addr;
 reg local_act_wr_en;
 reg [31:0] local_act_wr_addr;
 reg [31:0] local_act_wr_data;
-reg [4:0] state;
-integer current_head;
+reg [5:0] state;
 
-integer i;
+integer current_head;
+integer loop_i;
 integer timestep;
 integer head_base;
 integer kv_head;
@@ -185,137 +210,6 @@ always @(*) begin
         wgt_rd_addr = `WGT_RMS_ATT_BASE + rms_wgt_rd_addr;
     end
 end
-
-task read_kv;
-    input integer addr;
-    output real value;
-    begin
-        kv_rd_addr = addr;
-        kv_rd_en = 1'b1;
-        @(posedge clk);
-        kv_rd_en = 1'b0;
-        @(negedge clk);
-        value = fp32_to_real(kv_rd_data);
-    end
-endtask
-
-task write_kv;
-    input integer addr;
-    input real value;
-    begin
-        kv_wr_addr = addr;
-        kv_wr_data = real_to_fp32_bits(value);
-        kv_wr_en = 1'b1;
-        @(posedge clk);
-        kv_wr_en = 1'b0;
-    end
-endtask
-
-task read_act_local;
-    input integer addr;
-    output real value;
-    begin
-        local_act_rd_addr = addr;
-        local_act_rd_en = 1'b1;
-        @(posedge clk);
-        local_act_rd_en = 1'b0;
-        @(negedge clk);
-        value = fp32_to_real(act_rd_data);
-    end
-endtask
-
-task write_act_local;
-    input integer addr;
-    input real value;
-    begin
-        local_act_wr_addr = addr;
-        local_act_wr_data = real_to_fp32_bits(value);
-        local_act_wr_en = 1'b1;
-        @(posedge clk);
-        local_act_wr_en = 1'b0;
-    end
-endtask
-
-task copy_kv_cache;
-    input integer task_layer_idx;
-    input integer task_pos_idx;
-    begin
-        loff = (task_layer_idx * MAX_SEQ_LEN + task_pos_idx) * KV_DIM;
-        for (i = 0; i < KV_DIM; i = i + 1) begin
-            read_act_local(`ACT_K_BASE + i, kv_value);
-            write_kv(`KV_KEY_BASE + loff + i, kv_value);
-            read_act_local(`ACT_V_BASE + i, kv_value);
-            write_kv(`KV_VALUE_BASE + loff + i, kv_value);
-        end
-    end
-endtask
-
-task clear_xb_all;
-    begin
-        for (i = 0; i < DIM; i = i + 1) begin
-            write_act_local(`ACT_XB_BASE + i, 0.0);
-        end
-    end
-endtask
-
-task compute_scores_for_head;
-    input integer task_layer_idx;
-    input integer task_pos_idx;
-    input integer head_idx;
-    begin
-        inv_scale = 1.0 / $sqrt(HEAD_SIZE);
-        head_base = head_idx * HEAD_SIZE;
-        att_base = head_idx * MAX_SEQ_LEN;
-        kv_head = head_idx / KV_MUL;
-        loff = task_layer_idx * MAX_SEQ_LEN * KV_DIM;
-
-        for (timestep = 0; timestep <= task_pos_idx; timestep = timestep + 1) begin
-            cache_base = loff + timestep * KV_DIM + kv_head * HEAD_SIZE;
-            score = 0.0;
-            for (i = 0; i < HEAD_SIZE; i = i + 1) begin
-                read_act_local(`ACT_Q_BASE + head_base + i, act_value_a);
-                read_kv(`KV_KEY_BASE + cache_base + i, kv_value);
-                score = score + (act_value_a * kv_value);
-            end
-            write_act_local(`ACT_ATT_BASE + att_base + timestep, fp32_round(score * inv_scale));
-        end
-    end
-endtask
-
-task clear_xb_head;
-    input integer head_idx;
-    begin
-        head_base = head_idx * HEAD_SIZE;
-        for (i = 0; i < HEAD_SIZE; i = i + 1) begin
-            write_act_local(`ACT_XB_BASE + head_base + i, 0.0);
-        end
-    end
-endtask
-
-task merge_head_values;
-    input integer task_layer_idx;
-    input integer task_pos_idx;
-    input integer head_idx;
-    begin
-        head_base = head_idx * HEAD_SIZE;
-        att_base = head_idx * MAX_SEQ_LEN;
-        kv_head = head_idx / KV_MUL;
-        loff = task_layer_idx * MAX_SEQ_LEN * KV_DIM;
-
-        for (timestep = 0; timestep <= task_pos_idx; timestep = timestep + 1) begin
-            cache_base = loff + timestep * KV_DIM + kv_head * HEAD_SIZE;
-            for (i = 0; i < HEAD_SIZE; i = i + 1) begin
-                read_act_local(`ACT_XB_BASE + head_base + i, act_value_a);
-                read_act_local(`ACT_ATT_BASE + att_base + timestep, act_value_b);
-                read_kv(`KV_VALUE_BASE + cache_base + i, kv_value);
-                write_act_local(
-                    `ACT_XB_BASE + head_base + i,
-                    fp32_round(act_value_a + (act_value_b * kv_value))
-                );
-            end
-        end
-    end
-endtask
 
 kernel_rmsnorm #(
     .DIM(DIM)
@@ -421,8 +315,25 @@ always @(posedge clk or negedge rst_n) begin
         current_head <= 0;
         busy <= 1'b0;
         done <= 1'b0;
+        loop_i <= 0;
+        timestep <= 0;
+        head_base <= 0;
+        kv_head <= 0;
+        cache_base <= 0;
+        att_base <= 0;
+        loff <= 0;
+        kv_value <= 0.0;
+        score <= 0.0;
+        inv_scale <= 0.0;
+        act_value_a <= 0.0;
+        act_value_b <= 0.0;
     end else begin
         done <= 1'b0;
+        local_act_rd_en <= 1'b0;
+        local_act_wr_en <= 1'b0;
+        kv_rd_en <= 1'b0;
+        kv_wr_en <= 1'b0;
+
         case (state)
             STATE_IDLE: begin
                 busy <= 1'b0;
@@ -431,103 +342,216 @@ always @(posedge clk or negedge rst_n) begin
                     state <= STATE_RMS_START;
                 end
             end
-
-            STATE_RMS_START: begin
-                busy <= 1'b1;
-                state <= STATE_RMS_WAIT;
-            end
-
-            STATE_RMS_WAIT: begin
-                busy <= 1'b1;
-                if (rms_done) begin
-                    state <= STATE_QKV_START;
-                end
-            end
-
-            STATE_QKV_START: begin
-                busy <= 1'b1;
-                state <= STATE_QKV_WAIT;
-            end
-
-            STATE_QKV_WAIT: begin
-                busy <= 1'b1;
-                if (matmul_done) begin
-                    state <= STATE_ROPE_START;
-                end
-            end
-
-            STATE_ROPE_START: begin
-                busy <= 1'b1;
-                state <= STATE_ROPE_WAIT;
-            end
-
+            STATE_RMS_START: begin busy <= 1'b1; state <= STATE_RMS_WAIT; end
+            STATE_RMS_WAIT: begin busy <= 1'b1; if (rms_done) state <= STATE_QKV_START; end
+            STATE_QKV_START: begin busy <= 1'b1; state <= STATE_QKV_WAIT; end
+            STATE_QKV_WAIT: begin busy <= 1'b1; if (matmul_done) state <= STATE_ROPE_START; end
+            STATE_ROPE_START: begin busy <= 1'b1; state <= STATE_ROPE_WAIT; end
             STATE_ROPE_WAIT: begin
                 busy <= 1'b1;
                 if (rope_done) begin
-                    state <= STATE_KV_COPY;
+                    loff <= ({29'd0, layer_idx} * MAX_SEQ_LEN + pos_idx) * KV_DIM;
+                    loop_i <= 0;
+                    state <= STATE_KV_K_RD_REQ;
                 end
             end
 
-            STATE_KV_COPY: begin
+            STATE_KV_K_RD_REQ: begin
                 busy <= 1'b1;
-                copy_kv_cache(layer_idx, pos_idx);
-                clear_xb_all();
-                current_head <= 0;
-                state <= STATE_HEAD_SCORE;
+                local_act_rd_en <= 1'b1;
+                local_act_rd_addr <= `ACT_K_BASE + loop_i;
+                state <= STATE_KV_K_RD_WAIT;
+            end
+            STATE_KV_K_RD_WAIT: begin busy <= 1'b1; state <= STATE_KV_K_RD_CAP; end
+            STATE_KV_K_RD_CAP: begin
+                busy <= 1'b1;
+                kv_value <= fp32_to_real(act_rd_data);
+                state <= STATE_KV_K_WR;
+            end
+            STATE_KV_K_WR: begin
+                busy <= 1'b1;
+                kv_wr_en <= 1'b1;
+                kv_wr_addr <= `KV_KEY_BASE + loff + loop_i;
+                kv_wr_data <= real_to_fp32_bits(kv_value);
+                state <= STATE_KV_V_RD_REQ;
+            end
+            STATE_KV_V_RD_REQ: begin
+                busy <= 1'b1;
+                local_act_rd_en <= 1'b1;
+                local_act_rd_addr <= `ACT_V_BASE + loop_i;
+                state <= STATE_KV_V_RD_WAIT;
+            end
+            STATE_KV_V_RD_WAIT: begin busy <= 1'b1; state <= STATE_KV_V_RD_CAP; end
+            STATE_KV_V_RD_CAP: begin
+                busy <= 1'b1;
+                kv_value <= fp32_to_real(act_rd_data);
+                state <= STATE_KV_V_WR;
+            end
+            STATE_KV_V_WR: begin
+                busy <= 1'b1;
+                kv_wr_en <= 1'b1;
+                kv_wr_addr <= `KV_VALUE_BASE + loff + loop_i;
+                kv_wr_data <= real_to_fp32_bits(kv_value);
+                if (loop_i == (KV_DIM - 1)) begin
+                    loop_i <= 0;
+                    state <= STATE_CLEAR_ALL_WR;
+                end else begin
+                    loop_i <= loop_i + 1;
+                    state <= STATE_KV_K_RD_REQ;
+                end
             end
 
-            STATE_HEAD_SCORE: begin
+            STATE_CLEAR_ALL_WR: begin
                 busy <= 1'b1;
-                compute_scores_for_head(layer_idx, pos_idx, current_head);
-                state <= STATE_SOFTMAX_START;
+                local_act_wr_en <= 1'b1;
+                local_act_wr_addr <= `ACT_XB_BASE + loop_i;
+                local_act_wr_data <= 32'd0;
+                if (loop_i == (DIM - 1)) begin
+                    current_head <= 0;
+                    state <= STATE_HEAD_PREP;
+                end else begin
+                    loop_i <= loop_i + 1;
+                end
             end
 
-            STATE_SOFTMAX_START: begin
+            STATE_HEAD_PREP: begin
                 busy <= 1'b1;
-                state <= STATE_SOFTMAX_WAIT;
+                head_base <= current_head * HEAD_SIZE;
+                att_base <= current_head * MAX_SEQ_LEN;
+                kv_head <= current_head / KV_MUL;
+                loff <= {29'd0, layer_idx} * MAX_SEQ_LEN * KV_DIM;
+                inv_scale <= 1.0 / $sqrt(HEAD_SIZE);
+                timestep <= 0;
+                loop_i <= 0;
+                score <= 0.0;
+                state <= STATE_SCORE_Q_REQ;
+            end
+            STATE_SCORE_Q_REQ: begin
+                busy <= 1'b1;
+                cache_base <= loff + timestep * KV_DIM + kv_head * HEAD_SIZE;
+                local_act_rd_en <= 1'b1;
+                local_act_rd_addr <= `ACT_Q_BASE + head_base + loop_i;
+                state <= STATE_SCORE_Q_WAIT;
+            end
+            STATE_SCORE_Q_WAIT: begin busy <= 1'b1; state <= STATE_SCORE_Q_CAP; end
+            STATE_SCORE_Q_CAP: begin
+                busy <= 1'b1;
+                act_value_a <= fp32_to_real(act_rd_data);
+                state <= STATE_SCORE_KV_REQ;
+            end
+            STATE_SCORE_KV_REQ: begin
+                busy <= 1'b1;
+                kv_rd_en <= 1'b1;
+                kv_rd_addr <= `KV_KEY_BASE + cache_base + loop_i;
+                state <= STATE_SCORE_KV_WAIT;
+            end
+            STATE_SCORE_KV_WAIT: begin busy <= 1'b1; state <= STATE_SCORE_KV_CAP; end
+            STATE_SCORE_KV_CAP: begin
+                busy <= 1'b1;
+                kv_value <= fp32_to_real(kv_rd_data);
+                score <= score + (act_value_a * fp32_to_real(kv_rd_data));
+                if (loop_i == (HEAD_SIZE - 1)) begin
+                    state <= STATE_SCORE_WRITE;
+                end else begin
+                    loop_i <= loop_i + 1;
+                    state <= STATE_SCORE_Q_REQ;
+                end
+            end
+            STATE_SCORE_WRITE: begin
+                busy <= 1'b1;
+                local_act_wr_en <= 1'b1;
+                local_act_wr_addr <= `ACT_ATT_BASE + att_base + timestep;
+                local_act_wr_data <= real_to_fp32_bits(fp32_round(score * inv_scale));
+                if (timestep == pos_idx) begin
+                    state <= STATE_SOFTMAX_START;
+                end else begin
+                    timestep <= timestep + 1;
+                    loop_i <= 0;
+                    score <= 0.0;
+                    state <= STATE_SCORE_Q_REQ;
+                end
             end
 
+            STATE_SOFTMAX_START: begin busy <= 1'b1; state <= STATE_SOFTMAX_WAIT; end
             STATE_SOFTMAX_WAIT: begin
                 busy <= 1'b1;
                 if (softmax_done) begin
-                    state <= STATE_HEAD_MERGE;
+                    head_base <= current_head * HEAD_SIZE;
+                    att_base <= current_head * MAX_SEQ_LEN;
+                    kv_head <= current_head / KV_MUL;
+                    loff <= {29'd0, layer_idx} * MAX_SEQ_LEN * KV_DIM;
+                    loop_i <= 0;
+                    state <= STATE_CLEAR_HEAD_WR;
                 end
             end
 
-            STATE_HEAD_MERGE: begin
+            STATE_CLEAR_HEAD_WR: begin
                 busy <= 1'b1;
-                clear_xb_head(current_head);
-                merge_head_values(layer_idx, pos_idx, current_head);
-                if (current_head == (N_HEADS - 1)) begin
-                    state <= STATE_ATTN_OUT_START;
+                local_act_wr_en <= 1'b1;
+                local_act_wr_addr <= `ACT_XB_BASE + head_base + loop_i;
+                local_act_wr_data <= 32'd0;
+                if (loop_i == (HEAD_SIZE - 1)) begin
+                    timestep <= 0;
+                    loop_i <= 0;
+                    state <= STATE_MERGE_XB_REQ;
                 end else begin
-                    current_head <= current_head + 1;
-                    state <= STATE_HEAD_SCORE;
+                    loop_i <= loop_i + 1;
                 end
             end
 
-            STATE_ATTN_OUT_START: begin
+            STATE_MERGE_XB_REQ: begin
                 busy <= 1'b1;
-                state <= STATE_ATTN_OUT_WAIT;
+                cache_base <= loff + timestep * KV_DIM + kv_head * HEAD_SIZE;
+                local_act_rd_en <= 1'b1;
+                local_act_rd_addr <= `ACT_XB_BASE + head_base + loop_i;
+                state <= STATE_MERGE_XB_WAIT;
             end
-
-            STATE_ATTN_OUT_WAIT: begin
+            STATE_MERGE_XB_WAIT: begin busy <= 1'b1; state <= STATE_MERGE_XB_CAP; end
+            STATE_MERGE_XB_CAP: begin busy <= 1'b1; act_value_a <= fp32_to_real(act_rd_data); state <= STATE_MERGE_ATT_REQ; end
+            STATE_MERGE_ATT_REQ: begin
                 busy <= 1'b1;
-                if (matmul_done) begin
-                    state <= STATE_DONE;
+                local_act_rd_en <= 1'b1;
+                local_act_rd_addr <= `ACT_ATT_BASE + att_base + timestep;
+                state <= STATE_MERGE_ATT_WAIT;
+            end
+            STATE_MERGE_ATT_WAIT: begin busy <= 1'b1; state <= STATE_MERGE_ATT_CAP; end
+            STATE_MERGE_ATT_CAP: begin busy <= 1'b1; act_value_b <= fp32_to_real(act_rd_data); state <= STATE_MERGE_KV_REQ; end
+            STATE_MERGE_KV_REQ: begin
+                busy <= 1'b1;
+                kv_rd_en <= 1'b1;
+                kv_rd_addr <= `KV_VALUE_BASE + cache_base + loop_i;
+                state <= STATE_MERGE_KV_WAIT;
+            end
+            STATE_MERGE_KV_WAIT: begin busy <= 1'b1; state <= STATE_MERGE_KV_CAP; end
+            STATE_MERGE_KV_CAP: begin busy <= 1'b1; kv_value <= fp32_to_real(kv_rd_data); state <= STATE_MERGE_WRITE; end
+            STATE_MERGE_WRITE: begin
+                busy <= 1'b1;
+                local_act_wr_en <= 1'b1;
+                local_act_wr_addr <= `ACT_XB_BASE + head_base + loop_i;
+                local_act_wr_data <= real_to_fp32_bits(fp32_round(act_value_a + (act_value_b * kv_value)));
+                if (loop_i == (HEAD_SIZE - 1)) begin
+                    if (timestep == pos_idx) begin
+                        if (current_head == (N_HEADS - 1)) begin
+                            state <= STATE_ATTN_OUT_START;
+                        end else begin
+                            current_head <= current_head + 1;
+                            state <= STATE_HEAD_PREP;
+                        end
+                    end else begin
+                        timestep <= timestep + 1;
+                        loop_i <= 0;
+                        state <= STATE_MERGE_XB_REQ;
+                    end
+                end else begin
+                    loop_i <= loop_i + 1;
+                    state <= STATE_MERGE_XB_REQ;
                 end
             end
 
-            STATE_DONE: begin
-                busy <= 1'b0;
-                done <= 1'b1;
-                state <= STATE_IDLE;
-            end
-
-            default: begin
-                busy <= 1'b0;
-                state <= STATE_IDLE;
-            end
+            STATE_ATTN_OUT_START: begin busy <= 1'b1; state <= STATE_ATTN_OUT_WAIT; end
+            STATE_ATTN_OUT_WAIT: begin busy <= 1'b1; if (matmul_done) state <= STATE_DONE; end
+            STATE_DONE: begin busy <= 1'b0; done <= 1'b1; state <= STATE_IDLE; end
+            default: begin busy <= 1'b0; state <= STATE_IDLE; end
         endcase
     end
 end

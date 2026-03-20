@@ -2,6 +2,8 @@ software/
 
 AGENTS.md
 SPEC.md
+STATUS.md
+utils.md
 
 test/__pycache__
 test/sim_build

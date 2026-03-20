@@ -26,115 +26,31 @@ localparam OP_ATTN  = 2'd1;
 localparam OP_FFN   = 2'd2;
 localparam OP_FINAL = 2'd3;
 
-integer i;
+localparam STATE_IDLE        = 4'd0;
+localparam STATE_SUM_REQ     = 4'd1;
+localparam STATE_SUM_WAIT    = 4'd2;
+localparam STATE_SUM_CAP     = 4'd3;
+localparam STATE_PREP_WRITE  = 4'd4;
+localparam STATE_WGT_REQ     = 4'd5;
+localparam STATE_WGT_WAIT    = 4'd6;
+localparam STATE_WGT_CAP     = 4'd7;
+localparam STATE_ACT_REQ     = 4'd8;
+localparam STATE_ACT_WAIT    = 4'd9;
+localparam STATE_ACT_CAP     = 4'd10;
+localparam STATE_WRITE_REQ   = 4'd11;
+localparam STATE_WRITE_COMMIT= 4'd12;
+localparam STATE_DONE        = 4'd13;
+
+reg [3:0] state;
+reg [1:0] op_code_reg;
+reg [31:0] layer_idx_reg;
+reg [31:0] idx_reg;
+reg [31:0] weight_base_reg;
+reg [31:0] output_base_reg;
 real sum_sq;
 real inv_norm;
 real act_value;
 real wgt_value;
-
-task read_act;
-    input integer addr;
-    output real value;
-    begin
-        act_rd_addr = addr;
-        act_rd_en = 1'b1;
-        @(posedge clk);
-        act_rd_en = 1'b0;
-        @(negedge clk);
-        value = fp32_to_real(act_rd_data);
-    end
-endtask
-
-task write_act;
-    input integer addr;
-    input real value;
-    begin
-        act_wr_addr = addr;
-        act_wr_data = real_to_fp32_bits(value);
-        act_wr_en = 1'b1;
-        @(posedge clk);
-        act_wr_en = 1'b0;
-    end
-endtask
-
-task read_wgt;
-    input integer addr;
-    output real value;
-    begin
-        wgt_rd_addr = addr;
-        wgt_rd_en = 1'b1;
-        @(posedge clk);
-        wgt_rd_en = 1'b0;
-        @(negedge clk);
-        value = fp32_to_real(wgt_rd_data);
-    end
-endtask
-
-task apply_attn;
-    input integer task_layer_idx;
-    integer base_idx;
-    begin
-        sum_sq = 0.0;
-        for (i = 0; i < DIM; i = i + 1) begin
-            read_act(i, act_value);
-            sum_sq = sum_sq + (act_value * act_value);
-        end
-        sum_sq = (sum_sq / DIM) + 1e-5;
-        inv_norm = 1.0 / $sqrt(sum_sq);
-        base_idx = task_layer_idx * DIM;
-        for (i = 0; i < DIM; i = i + 1) begin
-            read_wgt(base_idx + i, wgt_value);
-            read_act(i, act_value);
-            write_act(
-                DIM + i,
-                fp32_round(wgt_value * (inv_norm * act_value))
-            );
-        end
-    end
-endtask
-
-task apply_ffn;
-    input integer task_layer_idx;
-    integer base_idx;
-    begin
-        sum_sq = 0.0;
-        for (i = 0; i < DIM; i = i + 1) begin
-            read_act(i, act_value);
-            sum_sq = sum_sq + (act_value * act_value);
-        end
-        sum_sq = (sum_sq / DIM) + 1e-5;
-        inv_norm = 1.0 / $sqrt(sum_sq);
-        base_idx = task_layer_idx * DIM;
-        for (i = 0; i < DIM; i = i + 1) begin
-            read_wgt(base_idx + i, wgt_value);
-            read_act(i, act_value);
-            write_act(
-                DIM + i,
-                fp32_round(wgt_value * (inv_norm * act_value))
-            );
-        end
-    end
-endtask
-
-task apply_final;
-    begin
-        sum_sq = 0.0;
-        for (i = 0; i < DIM; i = i + 1) begin
-            read_act(i, act_value);
-            sum_sq = sum_sq + (act_value * act_value);
-        end
-        sum_sq = (sum_sq / DIM) + 1e-5;
-        inv_norm = 1.0 / $sqrt(sum_sq);
-        for (i = 0; i < DIM; i = i + 1) begin
-            read_wgt(i, wgt_value);
-            read_act(i, act_value);
-            write_act(
-                i,
-                fp32_round(wgt_value * (inv_norm * act_value))
-            );
-        end
-    end
-endtask
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -147,22 +63,139 @@ always @(posedge clk or negedge rst_n) begin
         act_wr_data <= 32'd0;
         wgt_rd_en <= 1'b0;
         wgt_rd_addr <= 32'd0;
+        state <= STATE_IDLE;
+        op_code_reg <= 2'd0;
+        layer_idx_reg <= 32'd0;
+        idx_reg <= 32'd0;
+        weight_base_reg <= 32'd0;
+        output_base_reg <= 32'd0;
+        sum_sq <= 0.0;
+        inv_norm <= 0.0;
+        act_value <= 0.0;
+        wgt_value <= 0.0;
     end else begin
         done <= 1'b0;
-        if (start) begin
-            busy <= 1'b1;
-            if ((op_code == OP_FINAL) || (CONTROL_MODE == 2)) begin
-                apply_final();
-            end else if (op_code == OP_ATTN) begin
-                apply_attn(layer_idx);
-            end else if (op_code == OP_FFN) begin
-                apply_ffn(layer_idx);
+        act_rd_en <= 1'b0;
+        act_wr_en <= 1'b0;
+        wgt_rd_en <= 1'b0;
+
+        case (state)
+            STATE_IDLE: begin
+                busy <= 1'b0;
+                if (start) begin
+                    busy <= 1'b1;
+                    op_code_reg <= ((CONTROL_MODE == 2) && (op_code == 2'd0)) ? OP_FINAL : op_code;
+                    layer_idx_reg <= layer_idx;
+                    idx_reg <= 32'd0;
+                    sum_sq <= 0.0;
+                    if (((CONTROL_MODE == 2) && (op_code == 2'd0)) || (op_code == OP_FINAL)) begin
+                        weight_base_reg <= 32'd0;
+                        output_base_reg <= 32'd0;
+                    end else begin
+                        weight_base_reg <= layer_idx * DIM;
+                        output_base_reg <= DIM;
+                    end
+                    state <= STATE_SUM_REQ;
+                end
             end
-            busy <= 1'b0;
-            done <= 1'b1;
-        end else begin
-            busy <= 1'b0;
-        end
+
+            STATE_SUM_REQ: begin
+                busy <= 1'b1;
+                act_rd_en <= 1'b1;
+                act_rd_addr <= idx_reg;
+                state <= STATE_SUM_WAIT;
+            end
+
+            STATE_SUM_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_SUM_CAP;
+            end
+
+            STATE_SUM_CAP: begin
+                busy <= 1'b1;
+                act_value <= fp32_to_real(act_rd_data);
+                sum_sq <= sum_sq + (fp32_to_real(act_rd_data) * fp32_to_real(act_rd_data));
+                if (idx_reg == (DIM - 1)) begin
+                    state <= STATE_PREP_WRITE;
+                end else begin
+                    idx_reg <= idx_reg + 32'd1;
+                    state <= STATE_SUM_REQ;
+                end
+            end
+
+            STATE_PREP_WRITE: begin
+                busy <= 1'b1;
+                sum_sq <= (sum_sq / DIM) + 1e-5;
+                inv_norm <= 1.0 / $sqrt((sum_sq / DIM) + 1e-5);
+                idx_reg <= 32'd0;
+                state <= STATE_WGT_REQ;
+            end
+
+            STATE_WGT_REQ: begin
+                busy <= 1'b1;
+                wgt_rd_en <= 1'b1;
+                wgt_rd_addr <= weight_base_reg + idx_reg;
+                state <= STATE_WGT_WAIT;
+            end
+
+            STATE_WGT_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_WGT_CAP;
+            end
+
+            STATE_WGT_CAP: begin
+                busy <= 1'b1;
+                wgt_value <= fp32_to_real(wgt_rd_data);
+                state <= STATE_ACT_REQ;
+            end
+
+            STATE_ACT_REQ: begin
+                busy <= 1'b1;
+                act_rd_en <= 1'b1;
+                act_rd_addr <= idx_reg;
+                state <= STATE_ACT_WAIT;
+            end
+
+            STATE_ACT_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_ACT_CAP;
+            end
+
+            STATE_ACT_CAP: begin
+                busy <= 1'b1;
+                act_value <= fp32_to_real(act_rd_data);
+                state <= STATE_WRITE_REQ;
+            end
+
+            STATE_WRITE_REQ: begin
+                busy <= 1'b1;
+                act_wr_en <= 1'b1;
+                act_wr_addr <= output_base_reg + idx_reg;
+                act_wr_data <= real_to_fp32_bits(fp32_round(wgt_value * (inv_norm * act_value)));
+                state <= STATE_WRITE_COMMIT;
+            end
+
+            STATE_WRITE_COMMIT: begin
+                busy <= 1'b1;
+                if (idx_reg == (DIM - 1)) begin
+                    state <= STATE_DONE;
+                end else begin
+                    idx_reg <= idx_reg + 32'd1;
+                    state <= STATE_WGT_REQ;
+                end
+            end
+
+            STATE_DONE: begin
+                busy <= 1'b0;
+                done <= 1'b1;
+                state <= STATE_IDLE;
+            end
+
+            default: begin
+                busy <= 1'b0;
+                state <= STATE_IDLE;
+            end
+        endcase
     end
 end
 

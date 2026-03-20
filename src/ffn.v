@@ -26,16 +26,23 @@ module ffn #(
 localparam VOCAB_SIZE = 512;
 localparam N_LAYERS = 5;
 localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
+`include "memory_map.vh"
 
-localparam STATE_IDLE      = 4'd0;
-localparam STATE_RMS_START = 4'd1;
-localparam STATE_RMS_WAIT  = 4'd2;
-localparam STATE_W13_START = 4'd3;
-localparam STATE_W13_WAIT  = 4'd4;
-localparam STATE_SILU      = 4'd5;
-localparam STATE_W2_START  = 4'd6;
-localparam STATE_W2_WAIT   = 4'd7;
-localparam STATE_DONE      = 4'd8;
+localparam STATE_IDLE       = 5'd0;
+localparam STATE_RMS_START  = 5'd1;
+localparam STATE_RMS_WAIT   = 5'd2;
+localparam STATE_W13_START  = 5'd3;
+localparam STATE_W13_WAIT   = 5'd4;
+localparam STATE_SILU_RD0   = 5'd5;
+localparam STATE_SILU_RD0W  = 5'd6;
+localparam STATE_SILU_RD0C  = 5'd7;
+localparam STATE_SILU_RD1   = 5'd8;
+localparam STATE_SILU_RD1W  = 5'd9;
+localparam STATE_SILU_RD1C  = 5'd10;
+localparam STATE_SILU_WR    = 5'd11;
+localparam STATE_W2_START   = 5'd12;
+localparam STATE_W2_WAIT    = 5'd13;
+localparam STATE_DONE       = 5'd14;
 
 localparam RMS_OP_FFN      = 2'd2;
 localparam MATMUL_OP_W1_W3 = 3'd3;
@@ -70,9 +77,8 @@ reg [31:0] local_act_rd_addr;
 reg local_act_wr_en;
 reg [31:0] local_act_wr_addr;
 reg [31:0] local_act_wr_data;
-reg [3:0] state;
-
-integer i;
+reg [4:0] state;
+integer silu_idx;
 real val;
 real hb_val;
 real hb2_val;
@@ -124,43 +130,6 @@ always @(*) begin
         wgt_rd_addr = `WGT_RMS_FFN_BASE + rms_wgt_rd_addr;
     end
 end
-
-task read_act_local;
-    input integer addr;
-    output real value;
-    begin
-        local_act_rd_addr = addr;
-        local_act_rd_en = 1'b1;
-        @(posedge clk);
-        local_act_rd_en = 1'b0;
-        @(negedge clk);
-        value = fp32_to_real(act_rd_data);
-    end
-endtask
-
-task write_act_local;
-    input integer addr;
-    input real value;
-    begin
-        local_act_wr_addr = addr;
-        local_act_wr_data = real_to_fp32_bits(value);
-        local_act_wr_en = 1'b1;
-        @(posedge clk);
-        local_act_wr_en = 1'b0;
-    end
-endtask
-
-task apply_silu;
-    begin
-        for (i = 0; i < HIDDEN_DIM; i = i + 1) begin
-            read_act_local(`ACT_HB_BASE + i, hb_val);
-            read_act_local(`ACT_HB2_BASE + i, hb2_val);
-            val = hb_val;
-            val = val * (1.0 / (1.0 + $exp(-val)));
-            write_act_local(`ACT_HB_BASE + i, fp32_round(val * hb2_val));
-        end
-    end
-endtask
 
 kernel_rmsnorm #(
     .DIM(DIM)
@@ -219,8 +188,15 @@ always @(posedge clk or negedge rst_n) begin
         state <= STATE_IDLE;
         busy <= 1'b0;
         done <= 1'b0;
+        silu_idx <= 0;
+        val <= 0.0;
+        hb_val <= 0.0;
+        hb2_val <= 0.0;
     end else begin
         done <= 1'b0;
+        local_act_rd_en <= 1'b0;
+        local_act_wr_en <= 1'b0;
+
         case (state)
             STATE_IDLE: begin
                 busy <= 1'b0;
@@ -250,14 +226,59 @@ always @(posedge clk or negedge rst_n) begin
             STATE_W13_WAIT: begin
                 busy <= 1'b1;
                 if (matmul_done) begin
-                    state <= STATE_SILU;
+                    silu_idx <= 0;
+                    state <= STATE_SILU_RD0;
                 end
             end
 
-            STATE_SILU: begin
+            STATE_SILU_RD0: begin
                 busy <= 1'b1;
-                apply_silu();
-                state <= STATE_W2_START;
+                local_act_rd_en <= 1'b1;
+                local_act_rd_addr <= `ACT_HB_BASE + silu_idx;
+                state <= STATE_SILU_RD0W;
+            end
+
+            STATE_SILU_RD0W: begin
+                busy <= 1'b1;
+                state <= STATE_SILU_RD0C;
+            end
+
+            STATE_SILU_RD0C: begin
+                busy <= 1'b1;
+                hb_val <= fp32_to_real(act_rd_data);
+                state <= STATE_SILU_RD1;
+            end
+
+            STATE_SILU_RD1: begin
+                busy <= 1'b1;
+                local_act_rd_en <= 1'b1;
+                local_act_rd_addr <= `ACT_HB2_BASE + silu_idx;
+                state <= STATE_SILU_RD1W;
+            end
+
+            STATE_SILU_RD1W: begin
+                busy <= 1'b1;
+                state <= STATE_SILU_RD1C;
+            end
+
+            STATE_SILU_RD1C: begin
+                busy <= 1'b1;
+                hb2_val <= fp32_to_real(act_rd_data);
+                val <= hb_val * (1.0 / (1.0 + $exp(-hb_val)));
+                state <= STATE_SILU_WR;
+            end
+
+            STATE_SILU_WR: begin
+                busy <= 1'b1;
+                local_act_wr_en <= 1'b1;
+                local_act_wr_addr <= `ACT_HB_BASE + silu_idx;
+                local_act_wr_data <= real_to_fp32_bits(fp32_round(val * hb2_val));
+                if (silu_idx == (HIDDEN_DIM - 1)) begin
+                    state <= STATE_W2_START;
+                end else begin
+                    silu_idx <= silu_idx + 1;
+                    state <= STATE_SILU_RD0;
+                end
             end
 
             STATE_W2_START: begin

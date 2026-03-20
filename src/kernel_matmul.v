@@ -35,292 +35,248 @@ module kernel_matmul #(
     input wire [31:0] wgt_rd_data
 );
 
-`include "real_fp32_helpers.vh"
-
 localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
 
 `include "memory_map.vh"
 
-localparam PHASE_IDLE        = 3'd0;
-localparam PHASE_LOAD_X      = 3'd1;
-localparam PHASE_LOAD_W_TILE = 3'd2;
-localparam PHASE_COMPUTE     = 3'd3;
-localparam PHASE_WRITE_C     = 3'd4;
-localparam OP_QKV            = 3'd1;
-localparam OP_ATTN_OUT       = 3'd2;
-localparam OP_W1_W3          = 3'd3;
-localparam OP_W2             = 3'd4;
-localparam OP_CLASSIFY       = 3'd5;
+localparam OP_QKV       = 3'd1;
+localparam OP_ATTN_OUT  = 3'd2;
+localparam OP_W1_W3     = 3'd3;
+localparam OP_W2        = 3'd4;
+localparam OP_CLASSIFY  = 3'd5;
 
-integer i;
-integer j;
-integer base_idx;
-real acc;
-real max_logit;
-integer best_token;
-real act_value;
-real wgt_value;
-reg [2:0] phase;
+localparam STATE_IDLE               = 5'd0;
+localparam STATE_CONFIG             = 5'd1;
+localparam STATE_LOAD_X_REQ         = 5'd2;
+localparam STATE_LOAD_X_WAIT        = 5'd3;
+localparam STATE_LOAD_X_CAP         = 5'd4;
+localparam STATE_TILE_PREP          = 5'd5;
+localparam STATE_LOAD_W_REQ         = 5'd6;
+localparam STATE_LOAD_W_WAIT        = 5'd7;
+localparam STATE_LOAD_W_CAP         = 5'd8;
+localparam STATE_MAC_INIT           = 5'd9;
+localparam STATE_MAC_ACCUM          = 5'd10;
+localparam STATE_WRITE_REQ          = 5'd11;
+localparam STATE_WRITE_COMMIT       = 5'd12;
+localparam STATE_RESID_A_REQ        = 5'd13;
+localparam STATE_RESID_A_WAIT       = 5'd14;
+localparam STATE_RESID_A_CAP        = 5'd15;
+localparam STATE_RESID_B_REQ        = 5'd16;
+localparam STATE_RESID_B_WAIT       = 5'd17;
+localparam STATE_RESID_B_CAP        = 5'd18;
+localparam STATE_RESID_WRITE_REQ    = 5'd19;
+localparam STATE_RESID_WRITE_COMMIT = 5'd20;
+localparam STATE_DONE               = 5'd21;
+
+integer row_i;
+integer col_i;
+
+reg [4:0] state;
+reg [2:0] op_code_reg;
+reg [31:0] layer_idx_reg;
+reg [31:0] seq_index;
+reg [31:0] row_base;
+reg [31:0] tile_rows_reg;
+reg [31:0] row_offset;
+reg [31:0] k_index;
+reg [31:0] x_index;
+reg [31:0] write_index;
+reg [31:0] residual_index;
+reg [31:0] residual_a_bits;
+reg [31:0] residual_b_bits;
+reg [31:0] acc_work;
+reg [31:0] max_logit_bits;
+reg [TOKEN_W-1:0] best_token_reg;
 
 reg [31:0] x_buf [0:K_MAX-1];
 reg [31:0] w_buf [0:TM-1][0:K_MAX-1];
 reg [31:0] acc_buf [0:TM-1];
 
-task read_act_bits;
-    input integer addr;
-    output [31:0] bits;
-    begin
-        act_rd_addr = addr;
-        act_rd_en = 1'b1;
-        @(posedge clk);
-        act_rd_en = 1'b0;
-        @(negedge clk);
-        bits = act_rd_data;
-    end
-endtask
+reg [31:0] cfg_input_base;
+reg [31:0] cfg_input_k_size;
+reg [31:0] cfg_weight_base;
+reg [31:0] cfg_output_base;
+reg [31:0] cfg_m_size;
+reg [31:0] cfg_k_size;
+reg [31:0] cfg_seq_total;
+reg cfg_need_residual;
+reg cfg_classify;
+reg [31:0] cfg_residual_src_a_base;
+reg [31:0] cfg_residual_src_b_base;
+reg [31:0] cfg_residual_dst_base;
+reg [31:0] cfg_residual_len;
 
-task write_act_bits;
-    input integer addr;
-    input [31:0] bits;
-    begin
-        act_wr_addr = addr;
-        act_wr_data = bits;
-        act_wr_en = 1'b1;
-        @(posedge clk);
-        act_wr_en = 1'b0;
-    end
-endtask
+reg [31:0] mac_mul_a;
+reg [31:0] mac_mul_b;
+reg [31:0] add_in_a;
+reg [31:0] add_in_b;
 
-task read_act;
-    input integer addr;
-    output real value;
-    reg [31:0] bits;
-    begin
-        read_act_bits(addr, bits);
-        value = fp32_to_real(bits);
-    end
-endtask
+wire [31:0] mac_mul_y;
+wire [31:0] add_y;
 
-task write_act;
-    input integer addr;
-    input real value;
+function fp32_gt;
+    input [31:0] lhs;
+    input [31:0] rhs;
     begin
-        write_act_bits(addr, real_to_fp32_bits(value));
-    end
-endtask
-
-task read_wgt_bits;
-    input integer addr;
-    output [31:0] bits;
-    begin
-        wgt_rd_addr = addr;
-        wgt_rd_en = 1'b1;
-        @(posedge clk);
-        wgt_rd_en = 1'b0;
-        @(negedge clk);
-        bits = wgt_rd_data;
-    end
-endtask
-
-task read_wgt;
-    input integer addr;
-    output real value;
-    reg [31:0] bits;
-    begin
-        read_wgt_bits(addr, bits);
-        value = fp32_to_real(bits);
-    end
-endtask
-
-task load_x_buffer;
-    input integer input_base_addr;
-    input integer k_size;
-    integer k;
-    reg [31:0] bits;
-    begin
-        phase = PHASE_LOAD_X;
-        for (k = 0; k < k_size; k = k + 1) begin
-            read_act_bits(input_base_addr + k, bits);
-            x_buf[k] = bits;
-        end
-    end
-endtask
-
-task load_w_tile;
-    input integer weight_base_addr;
-    input integer row_base;
-    input integer tile_rows;
-    input integer k_size;
-    integer row_offset;
-    integer k;
-    reg [31:0] bits;
-    begin
-        phase = PHASE_LOAD_W_TILE;
-        for (row_offset = 0; row_offset < tile_rows; row_offset = row_offset + 1) begin
-            for (k = 0; k < k_size; k = k + 1) begin
-                read_wgt_bits(weight_base_addr + (row_base + row_offset) * k_size + k, bits);
-                w_buf[row_offset][k] = bits;
-            end
-        end
-    end
-endtask
-
-task compute_tile;
-    input integer tile_rows;
-    input integer k_size;
-    integer row_offset;
-    integer k;
-    real acc_real;
-    begin
-        phase = PHASE_COMPUTE;
-        for (row_offset = 0; row_offset < tile_rows; row_offset = row_offset + 1) begin
-            acc_real = 0.0;
-            for (k = 0; k < k_size; k = k + 1) begin
-                acc_real = acc_real
-                    + (fp32_to_real(w_buf[row_offset][k]) * fp32_to_real(x_buf[k]));
-            end
-            acc_buf[row_offset] = real_to_fp32_bits(fp32_round(acc_real));
-        end
-    end
-endtask
-
-task write_c_tile;
-    input integer output_base_addr;
-    input integer row_base;
-    input integer tile_rows;
-    integer row_offset;
-    begin
-        phase = PHASE_WRITE_C;
-        for (row_offset = 0; row_offset < tile_rows; row_offset = row_offset + 1) begin
-            write_act_bits(output_base_addr + row_base + row_offset, acc_buf[row_offset]);
-        end
-    end
-endtask
-
-task matvec_tiled_from_xbuf;
-    input integer weight_base_addr;
-    input integer output_base_addr;
-    input integer m_size;
-    input integer k_size;
-    integer row_base;
-    integer tile_rows;
-    begin
-        for (row_base = 0; row_base < m_size; row_base = row_base + TM) begin
-            if ((row_base + TM) <= m_size) begin
-                tile_rows = TM;
+        if ((rhs[30:0] == 31'd0) && (lhs[30:0] == 31'd0)) begin
+            fp32_gt = 1'b0;
+        end else if (lhs[31] != rhs[31]) begin
+            fp32_gt = rhs[31] && !lhs[31];
+        end else if (!lhs[31]) begin
+            if (lhs[30:23] != rhs[30:23]) begin
+                fp32_gt = lhs[30:23] > rhs[30:23];
             end else begin
-                tile_rows = m_size - row_base;
+                fp32_gt = lhs[22:0] > rhs[22:0];
             end
-            load_w_tile(weight_base_addr, row_base, tile_rows, k_size);
-            compute_tile(tile_rows, k_size);
-            write_c_tile(output_base_addr, row_base, tile_rows);
-        end
-    end
-endtask
-
-task project_qkv;
-    input integer task_layer_idx;
-    integer base_q;
-    integer base_k;
-    integer base_v;
-    begin
-        base_q = `WGT_WQ_BASE + task_layer_idx * DIM * DIM;
-        base_k = `WGT_WK_BASE + task_layer_idx * DIM * KV_DIM;
-        base_v = `WGT_WV_BASE + task_layer_idx * DIM * KV_DIM;
-
-        load_x_buffer(`ACT_XB_BASE, DIM);
-        matvec_tiled_from_xbuf(base_q, `ACT_Q_BASE, DIM, DIM);
-        matvec_tiled_from_xbuf(base_k, `ACT_K_BASE, KV_DIM, DIM);
-        matvec_tiled_from_xbuf(base_v, `ACT_V_BASE, KV_DIM, DIM);
-    end
-endtask
-
-task project_attention_output;
-    input integer task_layer_idx;
-    integer base_o;
-    real xb_val;
-    begin
-        base_o = `WGT_WO_BASE + task_layer_idx * DIM * DIM;
-        load_x_buffer(`ACT_XB_BASE, DIM);
-        matvec_tiled_from_xbuf(base_o, `ACT_XB2_BASE, DIM, DIM);
-
-        for (i = 0; i < DIM; i = i + 1) begin
-            read_act(`ACT_X_BASE + i, act_value);
-            read_act(`ACT_XB2_BASE + i, xb_val);
-            write_act(`ACT_X_BASE + i, fp32_round(act_value + xb_val));
-        end
-    end
-endtask
-
-task project_w1_w3;
-    input integer task_layer_idx;
-    integer base_w1;
-    integer base_w3;
-    begin
-        base_w1 = `WGT_W1_BASE + task_layer_idx * DIM * HIDDEN_DIM;
-        base_w3 = `WGT_W3_BASE + task_layer_idx * DIM * HIDDEN_DIM;
-
-        load_x_buffer(`ACT_XB_BASE, DIM);
-        matvec_tiled_from_xbuf(base_w1, `ACT_HB_BASE, HIDDEN_DIM, DIM);
-        matvec_tiled_from_xbuf(base_w3, `ACT_HB2_BASE, HIDDEN_DIM, DIM);
-    end
-endtask
-
-task project_w2;
-    input integer task_layer_idx;
-    integer base_w2;
-    real xb_val;
-    begin
-        base_w2 = `WGT_W2_BASE + task_layer_idx * HIDDEN_DIM * DIM;
-        load_x_buffer(`ACT_HB_BASE, HIDDEN_DIM);
-        matvec_tiled_from_xbuf(base_w2, `ACT_XB_BASE, DIM, HIDDEN_DIM);
-
-        for (i = 0; i < DIM; i = i + 1) begin
-            read_act(`ACT_X_BASE + i, act_value);
-            read_act(`ACT_XB_BASE + i, xb_val);
-            write_act(`ACT_X_BASE + i, fp32_round(act_value + xb_val));
-        end
-    end
-endtask
-
-task classify;
-    output [TOKEN_W-1:0] task_next_token;
-    output [LOGITS_W-1:0] task_flat_logits;
-    integer row_base;
-    integer tile_rows;
-    integer row_offset;
-    begin
-        best_token = 0;
-        max_logit = 0.0;
-        load_x_buffer(`ACT_X_BASE, DIM);
-
-        for (row_base = 0; row_base < VOCAB_SIZE; row_base = row_base + TM) begin
-            if ((row_base + TM) <= VOCAB_SIZE) begin
-                tile_rows = TM;
+        end else begin
+            if (lhs[30:23] != rhs[30:23]) begin
+                fp32_gt = lhs[30:23] < rhs[30:23];
             end else begin
-                tile_rows = VOCAB_SIZE - row_base;
-            end
-
-            load_w_tile(`WGT_TOKEN_EMBED_BASE, row_base, tile_rows, DIM);
-            compute_tile(tile_rows, DIM);
-            phase = PHASE_WRITE_C;
-            for (row_offset = 0; row_offset < tile_rows; row_offset = row_offset + 1) begin
-                write_act_bits(`ACT_LOGITS_BASE + row_base + row_offset, acc_buf[row_offset]);
-                act_value = fp32_to_real(acc_buf[row_offset]);
-                task_flat_logits[(row_base + row_offset) * LOGIT_W +: LOGIT_W] = acc_buf[row_offset];
-                if (((row_base + row_offset) == 0) || (act_value > max_logit)) begin
-                    max_logit = act_value;
-                    best_token = row_base + row_offset;
-                end
+                fp32_gt = lhs[22:0] < rhs[22:0];
             end
         end
-
-        task_next_token = best_token[TOKEN_W-1:0];
     end
-endtask
+endfunction
+
+always @(*) begin
+    cfg_input_base = `ACT_X_BASE;
+    cfg_input_k_size = DIM;
+    cfg_weight_base = 32'd0;
+    cfg_output_base = 32'd0;
+    cfg_m_size = 32'd0;
+    cfg_k_size = DIM;
+    cfg_seq_total = 32'd1;
+    cfg_need_residual = 1'b0;
+    cfg_classify = 1'b0;
+    cfg_residual_src_a_base = 32'd0;
+    cfg_residual_src_b_base = 32'd0;
+    cfg_residual_dst_base = 32'd0;
+    cfg_residual_len = 32'd0;
+
+    case (op_code_reg)
+        OP_QKV: begin
+            cfg_input_base = `ACT_XB_BASE;
+            cfg_input_k_size = DIM;
+            cfg_seq_total = 32'd3;
+            cfg_k_size = DIM;
+            if (seq_index == 32'd0) begin
+                cfg_weight_base = `WGT_WQ_BASE + layer_idx_reg * DIM * DIM;
+                cfg_output_base = `ACT_Q_BASE;
+                cfg_m_size = DIM;
+            end else if (seq_index == 32'd1) begin
+                cfg_weight_base = `WGT_WK_BASE + layer_idx_reg * DIM * KV_DIM;
+                cfg_output_base = `ACT_K_BASE;
+                cfg_m_size = KV_DIM;
+            end else begin
+                cfg_weight_base = `WGT_WV_BASE + layer_idx_reg * DIM * KV_DIM;
+                cfg_output_base = `ACT_V_BASE;
+                cfg_m_size = KV_DIM;
+            end
+        end
+        OP_ATTN_OUT: begin
+            cfg_input_base = `ACT_XB_BASE;
+            cfg_input_k_size = DIM;
+            cfg_seq_total = 32'd1;
+            cfg_weight_base = `WGT_WO_BASE + layer_idx_reg * DIM * DIM;
+            cfg_output_base = `ACT_XB2_BASE;
+            cfg_m_size = DIM;
+            cfg_k_size = DIM;
+            cfg_need_residual = 1'b1;
+            cfg_residual_src_a_base = `ACT_X_BASE;
+            cfg_residual_src_b_base = `ACT_XB2_BASE;
+            cfg_residual_dst_base = `ACT_X_BASE;
+            cfg_residual_len = DIM;
+        end
+        OP_W1_W3: begin
+            cfg_input_base = `ACT_XB_BASE;
+            cfg_input_k_size = DIM;
+            cfg_seq_total = 32'd2;
+            cfg_k_size = DIM;
+            if (seq_index == 32'd0) begin
+                cfg_weight_base = `WGT_W1_BASE + layer_idx_reg * DIM * HIDDEN_DIM;
+                cfg_output_base = `ACT_HB_BASE;
+            end else begin
+                cfg_weight_base = `WGT_W3_BASE + layer_idx_reg * DIM * HIDDEN_DIM;
+                cfg_output_base = `ACT_HB2_BASE;
+            end
+            cfg_m_size = HIDDEN_DIM;
+        end
+        OP_W2: begin
+            cfg_input_base = `ACT_HB_BASE;
+            cfg_input_k_size = HIDDEN_DIM;
+            cfg_seq_total = 32'd1;
+            cfg_weight_base = `WGT_W2_BASE + layer_idx_reg * HIDDEN_DIM * DIM;
+            cfg_output_base = `ACT_XB_BASE;
+            cfg_m_size = DIM;
+            cfg_k_size = HIDDEN_DIM;
+            cfg_need_residual = 1'b1;
+            cfg_residual_src_a_base = `ACT_X_BASE;
+            cfg_residual_src_b_base = `ACT_XB_BASE;
+            cfg_residual_dst_base = `ACT_X_BASE;
+            cfg_residual_len = DIM;
+        end
+        OP_CLASSIFY: begin
+            cfg_input_base = `ACT_X_BASE;
+            cfg_input_k_size = DIM;
+            cfg_seq_total = 32'd1;
+            cfg_weight_base = `WGT_TOKEN_EMBED_BASE;
+            cfg_output_base = `ACT_LOGITS_BASE;
+            cfg_m_size = VOCAB_SIZE;
+            cfg_k_size = DIM;
+            cfg_classify = 1'b1;
+        end
+        default: begin
+        end
+    endcase
+end
+
+always @(*) begin
+    mac_mul_a = 32'd0;
+    mac_mul_b = 32'd0;
+    add_in_a = 32'd0;
+    add_in_b = 32'd0;
+
+    if (state == STATE_MAC_ACCUM) begin
+        mac_mul_a = w_buf[row_offset][k_index];
+        mac_mul_b = x_buf[k_index];
+        add_in_a = acc_work;
+        add_in_b = mac_mul_y;
+    end else if (state == STATE_RESID_WRITE_REQ) begin
+        add_in_a = residual_a_bits;
+        add_in_b = residual_b_bits;
+    end
+end
+
+kernel_mul u_mul (
+    .a(mac_mul_a),
+    .b(mac_mul_b),
+    .y(mac_mul_y)
+);
+
+kernel_add u_add (
+    .a(add_in_a),
+    .b(add_in_b),
+    .y(add_y)
+);
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
+        state <= STATE_IDLE;
+        op_code_reg <= 3'd0;
+        layer_idx_reg <= 32'd0;
+        seq_index <= 32'd0;
+        row_base <= 32'd0;
+        tile_rows_reg <= 32'd0;
+        row_offset <= 32'd0;
+        k_index <= 32'd0;
+        x_index <= 32'd0;
+        write_index <= 32'd0;
+        residual_index <= 32'd0;
+        residual_a_bits <= 32'd0;
+        residual_b_bits <= 32'd0;
+        acc_work <= 32'd0;
+        max_logit_bits <= 32'd0;
+        best_token_reg <= {TOKEN_W{1'b0}};
         busy <= 1'b0;
         done <= 1'b0;
         next_token <= {TOKEN_W{1'b0}};
@@ -332,29 +288,245 @@ always @(posedge clk or negedge rst_n) begin
         act_wr_data <= 32'd0;
         wgt_rd_en <= 1'b0;
         wgt_rd_addr <= 32'd0;
-        phase <= PHASE_IDLE;
+        for (row_i = 0; row_i < K_MAX; row_i = row_i + 1) begin
+            x_buf[row_i] <= 32'd0;
+        end
+        for (row_i = 0; row_i < TM; row_i = row_i + 1) begin
+            acc_buf[row_i] <= 32'd0;
+            for (col_i = 0; col_i < K_MAX; col_i = col_i + 1) begin
+                w_buf[row_i][col_i] <= 32'd0;
+            end
+        end
     end else begin
         done <= 1'b0;
-        if (start) begin
-            busy <= 1'b1;
-            if ((op_code == OP_CLASSIFY) || (CONTROL_MODE == 4)) begin
-                classify(next_token, flat_logits);
-            end else if (op_code == OP_QKV) begin
-                project_qkv(layer_idx);
-            end else if (op_code == OP_ATTN_OUT) begin
-                project_attention_output(layer_idx);
-            end else if (op_code == OP_W1_W3) begin
-                project_w1_w3(layer_idx);
-            end else if (op_code == OP_W2) begin
-                project_w2(layer_idx);
+        act_rd_en <= 1'b0;
+        act_wr_en <= 1'b0;
+        wgt_rd_en <= 1'b0;
+
+        case (state)
+            STATE_IDLE: begin
+                busy <= 1'b0;
+                if (start) begin
+                    busy <= 1'b1;
+                    op_code_reg <= ((CONTROL_MODE == 4) && (op_code == 3'd0)) ? OP_CLASSIFY : op_code;
+                    layer_idx_reg <= layer_idx;
+                    seq_index <= 32'd0;
+                    next_token <= {TOKEN_W{1'b0}};
+                    flat_logits <= {LOGITS_W{1'b0}};
+                    max_logit_bits <= 32'd0;
+                    best_token_reg <= {TOKEN_W{1'b0}};
+                    state <= STATE_CONFIG;
+                end
             end
-            phase <= PHASE_IDLE;
-            busy <= 1'b0;
-            done <= 1'b1;
-        end else begin
-            phase <= PHASE_IDLE;
-            busy <= 1'b0;
-        end
+
+            STATE_CONFIG: begin
+                busy <= 1'b1;
+                x_index <= 32'd0;
+                row_base <= 32'd0;
+                residual_index <= 32'd0;
+                state <= STATE_LOAD_X_REQ;
+            end
+
+            STATE_LOAD_X_REQ: begin
+                busy <= 1'b1;
+                act_rd_en <= 1'b1;
+                act_rd_addr <= cfg_input_base + x_index;
+                state <= STATE_LOAD_X_WAIT;
+            end
+
+            STATE_LOAD_X_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_LOAD_X_CAP;
+            end
+
+            STATE_LOAD_X_CAP: begin
+                busy <= 1'b1;
+                x_buf[x_index] <= act_rd_data;
+                if (x_index == (cfg_input_k_size - 1)) begin
+                    state <= STATE_TILE_PREP;
+                end else begin
+                    x_index <= x_index + 32'd1;
+                    state <= STATE_LOAD_X_REQ;
+                end
+            end
+
+            STATE_TILE_PREP: begin
+                busy <= 1'b1;
+                row_offset <= 32'd0;
+                k_index <= 32'd0;
+                write_index <= 32'd0;
+                if ((row_base + TM) <= cfg_m_size) begin
+                    tile_rows_reg <= TM;
+                end else begin
+                    tile_rows_reg <= cfg_m_size - row_base;
+                end
+                state <= STATE_LOAD_W_REQ;
+            end
+
+            STATE_LOAD_W_REQ: begin
+                busy <= 1'b1;
+                wgt_rd_en <= 1'b1;
+                wgt_rd_addr <= cfg_weight_base + (row_base + row_offset) * cfg_k_size + k_index;
+                state <= STATE_LOAD_W_WAIT;
+            end
+
+            STATE_LOAD_W_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_LOAD_W_CAP;
+            end
+
+            STATE_LOAD_W_CAP: begin
+                busy <= 1'b1;
+                w_buf[row_offset][k_index] <= wgt_rd_data;
+                if (k_index == (cfg_k_size - 1)) begin
+                    if (row_offset == (tile_rows_reg - 1)) begin
+                        state <= STATE_MAC_INIT;
+                    end else begin
+                        row_offset <= row_offset + 32'd1;
+                        k_index <= 32'd0;
+                        state <= STATE_LOAD_W_REQ;
+                    end
+                end else begin
+                    k_index <= k_index + 32'd1;
+                    state <= STATE_LOAD_W_REQ;
+                end
+            end
+
+            STATE_MAC_INIT: begin
+                busy <= 1'b1;
+                row_offset <= 32'd0;
+                k_index <= 32'd0;
+                acc_work <= 32'd0;
+                state <= STATE_MAC_ACCUM;
+            end
+
+            STATE_MAC_ACCUM: begin
+                busy <= 1'b1;
+                if (k_index == (cfg_k_size - 1)) begin
+                    acc_buf[row_offset] <= add_y;
+                    if (row_offset == (tile_rows_reg - 1)) begin
+                        write_index <= 32'd0;
+                        state <= STATE_WRITE_REQ;
+                    end else begin
+                        row_offset <= row_offset + 32'd1;
+                        k_index <= 32'd0;
+                        acc_work <= 32'd0;
+                    end
+                end else begin
+                    acc_work <= add_y;
+                    k_index <= k_index + 32'd1;
+                end
+            end
+
+            STATE_WRITE_REQ: begin
+                busy <= 1'b1;
+                act_wr_en <= 1'b1;
+                act_wr_addr <= cfg_output_base + row_base + write_index;
+                act_wr_data <= acc_buf[write_index];
+                state <= STATE_WRITE_COMMIT;
+            end
+
+            STATE_WRITE_COMMIT: begin
+                busy <= 1'b1;
+                if (cfg_classify) begin
+                    flat_logits[(row_base + write_index) * LOGIT_W +: LOGIT_W] <= acc_buf[write_index];
+                    if (((row_base + write_index) == 0) || fp32_gt(acc_buf[write_index], max_logit_bits)) begin
+                        max_logit_bits <= acc_buf[write_index];
+                        best_token_reg <= row_base + write_index;
+                    end
+                end
+
+                if (write_index == (tile_rows_reg - 1)) begin
+                    if ((row_base + tile_rows_reg) >= cfg_m_size) begin
+                        if ((seq_index + 32'd1) < cfg_seq_total) begin
+                            seq_index <= seq_index + 32'd1;
+                            row_base <= 32'd0;
+                            state <= STATE_TILE_PREP;
+                        end else if (cfg_need_residual) begin
+                            residual_index <= 32'd0;
+                            state <= STATE_RESID_A_REQ;
+                        end else begin
+                            if (cfg_classify) begin
+                                next_token <= best_token_reg;
+                            end
+                            state <= STATE_DONE;
+                        end
+                    end else begin
+                        row_base <= row_base + tile_rows_reg;
+                        state <= STATE_TILE_PREP;
+                    end
+                end else begin
+                    write_index <= write_index + 32'd1;
+                    state <= STATE_WRITE_REQ;
+                end
+            end
+
+            STATE_RESID_A_REQ: begin
+                busy <= 1'b1;
+                act_rd_en <= 1'b1;
+                act_rd_addr <= cfg_residual_src_a_base + residual_index;
+                state <= STATE_RESID_A_WAIT;
+            end
+
+            STATE_RESID_A_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_RESID_A_CAP;
+            end
+
+            STATE_RESID_A_CAP: begin
+                busy <= 1'b1;
+                residual_a_bits <= act_rd_data;
+                state <= STATE_RESID_B_REQ;
+            end
+
+            STATE_RESID_B_REQ: begin
+                busy <= 1'b1;
+                act_rd_en <= 1'b1;
+                act_rd_addr <= cfg_residual_src_b_base + residual_index;
+                state <= STATE_RESID_B_WAIT;
+            end
+
+            STATE_RESID_B_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_RESID_B_CAP;
+            end
+
+            STATE_RESID_B_CAP: begin
+                busy <= 1'b1;
+                residual_b_bits <= act_rd_data;
+                state <= STATE_RESID_WRITE_REQ;
+            end
+
+            STATE_RESID_WRITE_REQ: begin
+                busy <= 1'b1;
+                act_wr_en <= 1'b1;
+                act_wr_addr <= cfg_residual_dst_base + residual_index;
+                act_wr_data <= add_y;
+                state <= STATE_RESID_WRITE_COMMIT;
+            end
+
+            STATE_RESID_WRITE_COMMIT: begin
+                busy <= 1'b1;
+                if (residual_index == (cfg_residual_len - 1)) begin
+                    state <= STATE_DONE;
+                end else begin
+                    residual_index <= residual_index + 32'd1;
+                    state <= STATE_RESID_A_REQ;
+                end
+            end
+
+            STATE_DONE: begin
+                busy <= 1'b0;
+                done <= 1'b1;
+                next_token <= best_token_reg;
+                state <= STATE_IDLE;
+            end
+
+            default: begin
+                busy <= 1'b0;
+                state <= STATE_IDLE;
+            end
+        endcase
     end
 end
 

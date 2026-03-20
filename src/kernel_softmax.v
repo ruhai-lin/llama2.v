@@ -20,74 +20,28 @@ module kernel_softmax #(
 
 `include "real_fp32_helpers.vh"
 
+localparam STATE_IDLE        = 4'd0;
+localparam STATE_MAX_REQ     = 4'd1;
+localparam STATE_MAX_WAIT    = 4'd2;
+localparam STATE_MAX_CAP     = 4'd3;
+localparam STATE_EXP_REQ     = 4'd4;
+localparam STATE_EXP_WAIT    = 4'd5;
+localparam STATE_EXP_CAP     = 4'd6;
+localparam STATE_EXP_WRITE   = 4'd7;
+localparam STATE_NORM_REQ    = 4'd8;
+localparam STATE_NORM_WAIT   = 4'd9;
+localparam STATE_NORM_CAP    = 4'd10;
+localparam STATE_NORM_WRITE  = 4'd11;
+localparam STATE_DONE        = 4'd12;
+
+reg [3:0] state;
+reg [31:0] head_idx_reg;
+reg [9:0] pos_idx_reg;
+reg [31:0] att_base_reg;
 integer timestep;
 real max_score;
 real sum_exp;
 real act_value;
-
-task read_act;
-    input integer addr;
-    output real value;
-    begin
-        act_rd_addr = addr;
-        act_rd_en = 1'b1;
-        @(posedge clk);
-        act_rd_en = 1'b0;
-        @(negedge clk);
-        value = fp32_to_real(act_rd_data);
-    end
-endtask
-
-task write_act;
-    input integer addr;
-    input real value;
-    begin
-        act_wr_addr = addr;
-        act_wr_data = real_to_fp32_bits(value);
-        act_wr_en = 1'b1;
-        @(posedge clk);
-        act_wr_en = 1'b0;
-    end
-endtask
-
-task normalize_head;
-    input integer head_idx;
-    input integer pos_idx;
-    integer att_base;
-    begin
-        att_base = ACT_ATT_BASE + head_idx * MAX_SEQ_LEN;
-        read_act(att_base, max_score);
-        for (timestep = 1; timestep <= pos_idx; timestep = timestep + 1) begin
-            read_act(att_base + timestep, act_value);
-            if (act_value > max_score) begin
-                max_score = act_value;
-            end
-        end
-
-        sum_exp = 0.0;
-        for (timestep = 0; timestep <= pos_idx; timestep = timestep + 1) begin
-            read_act(att_base + timestep, act_value);
-            act_value = fp32_round($exp(act_value - max_score));
-            write_act(att_base + timestep, act_value);
-            sum_exp = sum_exp + act_value;
-        end
-
-        for (timestep = 0; timestep <= pos_idx; timestep = timestep + 1) begin
-            read_act(att_base + timestep, act_value);
-            write_act(att_base + timestep, fp32_round(act_value / sum_exp));
-        end
-    end
-endtask
-
-initial begin
-    act_rd_en = 1'b0;
-    act_rd_addr = 32'd0;
-    act_wr_en = 1'b0;
-    act_wr_addr = 32'd0;
-    act_wr_data = 32'd0;
-    busy = 1'b0;
-    done = 1'b0;
-end
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -98,16 +52,137 @@ always @(posedge clk or negedge rst_n) begin
         act_wr_data <= 32'd0;
         busy <= 1'b0;
         done <= 1'b0;
+        state <= STATE_IDLE;
+        head_idx_reg <= 32'd0;
+        pos_idx_reg <= 10'd0;
+        att_base_reg <= 32'd0;
+        timestep <= 0;
+        max_score <= 0.0;
+        sum_exp <= 0.0;
+        act_value <= 0.0;
     end else begin
         done <= 1'b0;
-        if (start) begin
-            busy <= 1'b1;
-            normalize_head(head_idx, pos_idx);
-            busy <= 1'b0;
-            done <= 1'b1;
-        end else begin
-            busy <= 1'b0;
-        end
+        act_rd_en <= 1'b0;
+        act_wr_en <= 1'b0;
+
+        case (state)
+            STATE_IDLE: begin
+                busy <= 1'b0;
+                if (start) begin
+                    busy <= 1'b1;
+                    head_idx_reg <= head_idx;
+                    pos_idx_reg <= pos_idx;
+                    att_base_reg <= ACT_ATT_BASE + head_idx * MAX_SEQ_LEN;
+                    timestep <= 0;
+                    max_score <= 0.0;
+                    sum_exp <= 0.0;
+                    state <= STATE_MAX_REQ;
+                end
+            end
+
+            STATE_MAX_REQ: begin
+                busy <= 1'b1;
+                act_rd_en <= 1'b1;
+                act_rd_addr <= att_base_reg + timestep;
+                state <= STATE_MAX_WAIT;
+            end
+
+            STATE_MAX_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_MAX_CAP;
+            end
+
+            STATE_MAX_CAP: begin
+                busy <= 1'b1;
+                act_value <= fp32_to_real(act_rd_data);
+                if ((timestep == 0) || (fp32_to_real(act_rd_data) > max_score)) begin
+                    max_score <= fp32_to_real(act_rd_data);
+                end
+                if (timestep == pos_idx_reg) begin
+                    timestep <= 0;
+                    sum_exp <= 0.0;
+                    state <= STATE_EXP_REQ;
+                end else begin
+                    timestep <= timestep + 1;
+                    state <= STATE_MAX_REQ;
+                end
+            end
+
+            STATE_EXP_REQ: begin
+                busy <= 1'b1;
+                act_rd_en <= 1'b1;
+                act_rd_addr <= att_base_reg + timestep;
+                state <= STATE_EXP_WAIT;
+            end
+
+            STATE_EXP_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_EXP_CAP;
+            end
+
+            STATE_EXP_CAP: begin
+                busy <= 1'b1;
+                act_value <= fp32_round($exp(fp32_to_real(act_rd_data) - max_score));
+                state <= STATE_EXP_WRITE;
+            end
+
+            STATE_EXP_WRITE: begin
+                busy <= 1'b1;
+                act_wr_en <= 1'b1;
+                act_wr_addr <= att_base_reg + timestep;
+                act_wr_data <= real_to_fp32_bits(act_value);
+                sum_exp <= sum_exp + act_value;
+                if (timestep == pos_idx_reg) begin
+                    timestep <= 0;
+                    state <= STATE_NORM_REQ;
+                end else begin
+                    timestep <= timestep + 1;
+                    state <= STATE_EXP_REQ;
+                end
+            end
+
+            STATE_NORM_REQ: begin
+                busy <= 1'b1;
+                act_rd_en <= 1'b1;
+                act_rd_addr <= att_base_reg + timestep;
+                state <= STATE_NORM_WAIT;
+            end
+
+            STATE_NORM_WAIT: begin
+                busy <= 1'b1;
+                state <= STATE_NORM_CAP;
+            end
+
+            STATE_NORM_CAP: begin
+                busy <= 1'b1;
+                act_value <= fp32_to_real(act_rd_data);
+                state <= STATE_NORM_WRITE;
+            end
+
+            STATE_NORM_WRITE: begin
+                busy <= 1'b1;
+                act_wr_en <= 1'b1;
+                act_wr_addr <= att_base_reg + timestep;
+                act_wr_data <= real_to_fp32_bits(fp32_round(act_value / sum_exp));
+                if (timestep == pos_idx_reg) begin
+                    state <= STATE_DONE;
+                end else begin
+                    timestep <= timestep + 1;
+                    state <= STATE_NORM_REQ;
+                end
+            end
+
+            STATE_DONE: begin
+                busy <= 1'b0;
+                done <= 1'b1;
+                state <= STATE_IDLE;
+            end
+
+            default: begin
+                busy <= 1'b0;
+                state <= STATE_IDLE;
+            end
+        endcase
     end
 end
 
