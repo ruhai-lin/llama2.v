@@ -22,7 +22,7 @@ async def generate_free_run(dut):
     dut.in_token_id.value = 0
     dut.is_prompt_token.value = 0
 
-    clock = Clock(dut.clk, 10, units="ns")
+    clock = Clock(dut.clk, 10, unit="ns")
     cocotb.start_soon(clock.start())
 
     for _ in range(3):

@@ -23,8 +23,6 @@ module top_level_module #(
     output wire busy
 );
 
-`include "real_fp32_helpers.vh"
-
 localparam FSM_IDLE            = 4'd0;
 localparam FSM_EMBED           = 4'd1;
 localparam FSM_BLOCK_START     = 4'd2;
@@ -48,7 +46,7 @@ reg weights_initialized;
 
 integer embed_idx;
 integer embed_base_idx;
-real embed_value;
+reg [31:0] embed_bits;
 reg local_act_wr_en;
 reg [31:0] local_act_wr_addr;
 reg [31:0] local_act_wr_data;
@@ -396,7 +394,7 @@ always @(posedge clk or negedge rst_n) begin
         embed_state <= EMBED_IDLE;
         embed_idx <= 0;
         embed_base_idx <= 0;
-        embed_value <= 0.0;
+        embed_bits <= 32'd0;
     end else begin
         embed_done_reg <= 1'b0;
         local_act_wr_en <= 1'b0;
@@ -432,14 +430,14 @@ always @(posedge clk or negedge rst_n) begin
                 end
 
                 EMBED_WGT_CAP: begin
-                    embed_value <= fp32_to_real(mem_wgt_rd_data);
+                    embed_bits <= mem_wgt_rd_data;
                     embed_state <= EMBED_ACT_WR;
                 end
 
                 EMBED_ACT_WR: begin
                     local_act_wr_en <= 1'b1;
                     local_act_wr_addr <= `ACT_X_BASE + embed_idx;
-                    local_act_wr_data <= real_to_fp32_bits(embed_value);
+                    local_act_wr_data <= embed_bits;
                     if (embed_idx == (DIM - 1)) begin
                         embed_state <= EMBED_DONE;
                     end else begin

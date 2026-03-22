@@ -28,8 +28,6 @@ module attn #(
     output reg done
 );
 
-`include "real_fp32_helpers.vh"
-
 localparam VOCAB_SIZE = 512;
 localparam N_LAYERS = 5;
 localparam HIDDEN_DIM = 172;
@@ -79,6 +77,9 @@ localparam STATE_MERGE_WRITE     = 6'd36;
 localparam STATE_ATTN_OUT_START  = 6'd37;
 localparam STATE_ATTN_OUT_WAIT   = 6'd38;
 localparam STATE_DONE            = 6'd39;
+localparam STATE_SCORE_ACCUM     = 6'd40;
+localparam STATE_SCORE_SCALE     = 6'd41;
+localparam STATE_MERGE_ACCUM     = 6'd42;
 
 localparam RMS_OP_ATTN           = 2'd1;
 localparam MATMUL_OP_QKV         = 3'd1;
@@ -141,11 +142,21 @@ integer kv_head;
 integer cache_base;
 integer att_base;
 integer loff;
-real kv_value;
-real score;
-real inv_scale;
-real act_value_a;
-real act_value_b;
+reg [31:0] kv_bits;
+reg [31:0] q_bits;
+reg [31:0] score_bits;
+reg [31:0] scaled_score_bits;
+reg [31:0] xb_bits;
+reg [31:0] att_bits;
+reg [31:0] v_bits;
+reg [31:0] mul_a;
+reg [31:0] mul_b;
+reg [31:0] add_a;
+reg [31:0] add_b;
+wire [31:0] mul_y;
+wire [31:0] add_y;
+
+localparam [31:0] INV_SCALE_BITS = 32'h3eb504f3;  // 1/sqrt(8)
 
 assign rms_act_rd_data = act_rd_data;
 assign matmul_act_rd_data = act_rd_data;
@@ -209,7 +220,45 @@ always @(*) begin
         wgt_rd_en = 1'b1;
         wgt_rd_addr = `WGT_RMS_ATT_BASE + rms_wgt_rd_addr;
     end
+
+    mul_a = 32'd0;
+    mul_b = 32'd0;
+    add_a = 32'd0;
+    add_b = 32'd0;
+
+    case (state)
+        STATE_SCORE_ACCUM: begin
+            mul_a = q_bits;
+            mul_b = kv_bits;
+            add_a = score_bits;
+            add_b = mul_y;
+        end
+        STATE_SCORE_SCALE: begin
+            mul_a = score_bits;
+            mul_b = INV_SCALE_BITS;
+        end
+        STATE_MERGE_ACCUM: begin
+            mul_a = att_bits;
+            mul_b = v_bits;
+            add_a = xb_bits;
+            add_b = mul_y;
+        end
+        default: begin
+        end
+    endcase
 end
+
+kernel_mul u_local_mul (
+    .a(mul_a),
+    .b(mul_b),
+    .y(mul_y)
+);
+
+kernel_add u_local_add (
+    .a(add_a),
+    .b(add_b),
+    .y(add_y)
+);
 
 kernel_rmsnorm #(
     .DIM(DIM)
@@ -322,11 +371,13 @@ always @(posedge clk or negedge rst_n) begin
         cache_base <= 0;
         att_base <= 0;
         loff <= 0;
-        kv_value <= 0.0;
-        score <= 0.0;
-        inv_scale <= 0.0;
-        act_value_a <= 0.0;
-        act_value_b <= 0.0;
+        kv_bits <= 32'd0;
+        q_bits <= 32'd0;
+        score_bits <= 32'd0;
+        scaled_score_bits <= 32'd0;
+        xb_bits <= 32'd0;
+        att_bits <= 32'd0;
+        v_bits <= 32'd0;
     end else begin
         done <= 1'b0;
         local_act_rd_en <= 1'b0;
@@ -365,14 +416,14 @@ always @(posedge clk or negedge rst_n) begin
             STATE_KV_K_RD_WAIT: begin busy <= 1'b1; state <= STATE_KV_K_RD_CAP; end
             STATE_KV_K_RD_CAP: begin
                 busy <= 1'b1;
-                kv_value <= fp32_to_real(act_rd_data);
+                kv_bits <= act_rd_data;
                 state <= STATE_KV_K_WR;
             end
             STATE_KV_K_WR: begin
                 busy <= 1'b1;
                 kv_wr_en <= 1'b1;
                 kv_wr_addr <= `KV_KEY_BASE + loff + loop_i;
-                kv_wr_data <= real_to_fp32_bits(kv_value);
+                kv_wr_data <= kv_bits;
                 state <= STATE_KV_V_RD_REQ;
             end
             STATE_KV_V_RD_REQ: begin
@@ -384,14 +435,14 @@ always @(posedge clk or negedge rst_n) begin
             STATE_KV_V_RD_WAIT: begin busy <= 1'b1; state <= STATE_KV_V_RD_CAP; end
             STATE_KV_V_RD_CAP: begin
                 busy <= 1'b1;
-                kv_value <= fp32_to_real(act_rd_data);
+                kv_bits <= act_rd_data;
                 state <= STATE_KV_V_WR;
             end
             STATE_KV_V_WR: begin
                 busy <= 1'b1;
                 kv_wr_en <= 1'b1;
                 kv_wr_addr <= `KV_VALUE_BASE + loff + loop_i;
-                kv_wr_data <= real_to_fp32_bits(kv_value);
+                kv_wr_data <= kv_bits;
                 if (loop_i == (KV_DIM - 1)) begin
                     loop_i <= 0;
                     state <= STATE_CLEAR_ALL_WR;
@@ -420,10 +471,9 @@ always @(posedge clk or negedge rst_n) begin
                 att_base <= current_head * MAX_SEQ_LEN;
                 kv_head <= current_head / KV_MUL;
                 loff <= {29'd0, layer_idx} * MAX_SEQ_LEN * KV_DIM;
-                inv_scale <= 1.0 / $sqrt(HEAD_SIZE);
                 timestep <= 0;
                 loop_i <= 0;
-                score <= 0.0;
+                score_bits <= 32'd0;
                 state <= STATE_SCORE_Q_REQ;
             end
             STATE_SCORE_Q_REQ: begin
@@ -436,7 +486,7 @@ always @(posedge clk or negedge rst_n) begin
             STATE_SCORE_Q_WAIT: begin busy <= 1'b1; state <= STATE_SCORE_Q_CAP; end
             STATE_SCORE_Q_CAP: begin
                 busy <= 1'b1;
-                act_value_a <= fp32_to_real(act_rd_data);
+                q_bits <= act_rd_data;
                 state <= STATE_SCORE_KV_REQ;
             end
             STATE_SCORE_KV_REQ: begin
@@ -448,26 +498,35 @@ always @(posedge clk or negedge rst_n) begin
             STATE_SCORE_KV_WAIT: begin busy <= 1'b1; state <= STATE_SCORE_KV_CAP; end
             STATE_SCORE_KV_CAP: begin
                 busy <= 1'b1;
-                kv_value <= fp32_to_real(kv_rd_data);
-                score <= score + (act_value_a * fp32_to_real(kv_rd_data));
+                kv_bits <= kv_rd_data;
+                state <= STATE_SCORE_ACCUM;
+            end
+            STATE_SCORE_ACCUM: begin
+                busy <= 1'b1;
+                score_bits <= add_y;
                 if (loop_i == (HEAD_SIZE - 1)) begin
-                    state <= STATE_SCORE_WRITE;
+                    state <= STATE_SCORE_SCALE;
                 end else begin
                     loop_i <= loop_i + 1;
                     state <= STATE_SCORE_Q_REQ;
                 end
             end
+            STATE_SCORE_SCALE: begin
+                busy <= 1'b1;
+                scaled_score_bits <= mul_y;
+                state <= STATE_SCORE_WRITE;
+            end
             STATE_SCORE_WRITE: begin
                 busy <= 1'b1;
                 local_act_wr_en <= 1'b1;
                 local_act_wr_addr <= `ACT_ATT_BASE + att_base + timestep;
-                local_act_wr_data <= real_to_fp32_bits(fp32_round(score * inv_scale));
+                local_act_wr_data <= scaled_score_bits;
                 if (timestep == pos_idx) begin
                     state <= STATE_SOFTMAX_START;
                 end else begin
                     timestep <= timestep + 1;
                     loop_i <= 0;
-                    score <= 0.0;
+                    score_bits <= 32'd0;
                     state <= STATE_SCORE_Q_REQ;
                 end
             end
@@ -507,7 +566,7 @@ always @(posedge clk or negedge rst_n) begin
                 state <= STATE_MERGE_XB_WAIT;
             end
             STATE_MERGE_XB_WAIT: begin busy <= 1'b1; state <= STATE_MERGE_XB_CAP; end
-            STATE_MERGE_XB_CAP: begin busy <= 1'b1; act_value_a <= fp32_to_real(act_rd_data); state <= STATE_MERGE_ATT_REQ; end
+            STATE_MERGE_XB_CAP: begin busy <= 1'b1; xb_bits <= act_rd_data; state <= STATE_MERGE_ATT_REQ; end
             STATE_MERGE_ATT_REQ: begin
                 busy <= 1'b1;
                 local_act_rd_en <= 1'b1;
@@ -515,7 +574,7 @@ always @(posedge clk or negedge rst_n) begin
                 state <= STATE_MERGE_ATT_WAIT;
             end
             STATE_MERGE_ATT_WAIT: begin busy <= 1'b1; state <= STATE_MERGE_ATT_CAP; end
-            STATE_MERGE_ATT_CAP: begin busy <= 1'b1; act_value_b <= fp32_to_real(act_rd_data); state <= STATE_MERGE_KV_REQ; end
+            STATE_MERGE_ATT_CAP: begin busy <= 1'b1; att_bits <= act_rd_data; state <= STATE_MERGE_KV_REQ; end
             STATE_MERGE_KV_REQ: begin
                 busy <= 1'b1;
                 kv_rd_en <= 1'b1;
@@ -523,12 +582,12 @@ always @(posedge clk or negedge rst_n) begin
                 state <= STATE_MERGE_KV_WAIT;
             end
             STATE_MERGE_KV_WAIT: begin busy <= 1'b1; state <= STATE_MERGE_KV_CAP; end
-            STATE_MERGE_KV_CAP: begin busy <= 1'b1; kv_value <= fp32_to_real(kv_rd_data); state <= STATE_MERGE_WRITE; end
+            STATE_MERGE_KV_CAP: begin busy <= 1'b1; v_bits <= kv_rd_data; state <= STATE_MERGE_ACCUM; end
+            STATE_MERGE_ACCUM: begin busy <= 1'b1; local_act_wr_data <= add_y; state <= STATE_MERGE_WRITE; end
             STATE_MERGE_WRITE: begin
                 busy <= 1'b1;
                 local_act_wr_en <= 1'b1;
                 local_act_wr_addr <= `ACT_XB_BASE + head_base + loop_i;
-                local_act_wr_data <= real_to_fp32_bits(fp32_round(act_value_a + (act_value_b * kv_value)));
                 if (loop_i == (HEAD_SIZE - 1)) begin
                     if (timestep == pos_idx) begin
                         if (current_head == (N_HEADS - 1)) begin

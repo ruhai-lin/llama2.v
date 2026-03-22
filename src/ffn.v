@@ -21,8 +21,6 @@ module ffn #(
     output reg done
 );
 
-`include "real_fp32_helpers.vh"
-
 localparam VOCAB_SIZE = 512;
 localparam N_LAYERS = 5;
 localparam KV_DIM = (DIM * N_KV_HEADS) / N_HEADS;
@@ -39,10 +37,16 @@ localparam STATE_SILU_RD0C  = 5'd7;
 localparam STATE_SILU_RD1   = 5'd8;
 localparam STATE_SILU_RD1W  = 5'd9;
 localparam STATE_SILU_RD1C  = 5'd10;
-localparam STATE_SILU_WR    = 5'd11;
-localparam STATE_W2_START   = 5'd12;
-localparam STATE_W2_WAIT    = 5'd13;
-localparam STATE_DONE       = 5'd14;
+localparam STATE_SILU_EXP   = 5'd11;
+localparam STATE_SILU_DENOM = 5'd12;
+localparam STATE_SILU_RECIP = 5'd13;
+localparam STATE_SILU_SIGM  = 5'd14;
+localparam STATE_SILU_XMUL  = 5'd15;
+localparam STATE_SILU_FINAL = 5'd16;
+localparam STATE_SILU_WR    = 5'd17;
+localparam STATE_W2_START   = 5'd18;
+localparam STATE_W2_WAIT    = 5'd19;
+localparam STATE_DONE       = 5'd20;
 
 localparam RMS_OP_FFN      = 2'd2;
 localparam MATMUL_OP_W1_W3 = 3'd3;
@@ -79,14 +83,103 @@ reg [31:0] local_act_wr_addr;
 reg [31:0] local_act_wr_data;
 reg [4:0] state;
 integer silu_idx;
-real val;
-real hb_val;
-real hb2_val;
+reg [31:0] hb_bits;
+reg [31:0] hb2_bits;
+reg [31:0] exp_input_bits;
+reg [31:0] exp_bits;
+reg [31:0] numerator_bits;
+reg [31:0] denom_bits;
+reg [31:0] recip_bits;
+reg [31:0] sigmoid_bits;
+reg [31:0] silu_bits;
+
+reg [31:0] exp_lut [0:4095];
+reg [31:0] reciprocal_lut [0:4095];
+integer lut_fd;
+reg [31:0] mul_a;
+reg [31:0] mul_b;
+reg [31:0] add_a;
+reg [31:0] add_b;
+wire [31:0] mul_y;
+wire [31:0] add_y;
+
+localparam [31:0] FP_ONE_BITS = 32'h3f800000;
 
 assign rms_act_rd_data = act_rd_data;
 assign matmul_act_rd_data = act_rd_data;
 assign rms_wgt_rd_data = wgt_rd_data;
 assign matmul_wgt_rd_data = wgt_rd_data;
+
+function [11:0] lut_index_from_bits;
+    input [31:0] bits;
+    begin
+        lut_index_from_bits = {bits[30:23], bits[22:19]};
+    end
+endfunction
+
+function fp32_is_zero;
+    input [31:0] bits;
+    begin
+        fp32_is_zero = (bits[30:0] == 31'd0);
+    end
+endfunction
+
+function [11:0] exp_lut_index_nonpos;
+    input [31:0] bits;
+    begin
+        if (fp32_is_zero(bits)) begin
+            exp_lut_index_nonpos = 12'd0;
+        end else if (bits[31] == 1'b0) begin
+            exp_lut_index_nonpos = 12'd0;
+        end else begin
+            exp_lut_index_nonpos = lut_index_from_bits(bits);
+        end
+    end
+endfunction
+
+initial begin
+    lut_fd = $fopen("src/LUTs/exp_lut.hex", "r");
+    if (lut_fd != 0) begin
+        $fclose(lut_fd);
+        $readmemh("src/LUTs/exp_lut.hex", exp_lut);
+    end else begin
+        lut_fd = $fopen("../src/LUTs/exp_lut.hex", "r");
+        if (lut_fd != 0) begin
+            $fclose(lut_fd);
+            $readmemh("../src/LUTs/exp_lut.hex", exp_lut);
+        end else begin
+            lut_fd = $fopen("../../src/LUTs/exp_lut.hex", "r");
+            if (lut_fd != 0) begin
+                $fclose(lut_fd);
+                $readmemh("../../src/LUTs/exp_lut.hex", exp_lut);
+            end else begin
+                $display("ERROR: ffn could not locate exp_lut.hex");
+                $finish;
+            end
+        end
+    end
+
+    lut_fd = $fopen("src/LUTs/reciprocal_lut.hex", "r");
+    if (lut_fd != 0) begin
+        $fclose(lut_fd);
+        $readmemh("src/LUTs/reciprocal_lut.hex", reciprocal_lut);
+    end else begin
+        lut_fd = $fopen("../src/LUTs/reciprocal_lut.hex", "r");
+        if (lut_fd != 0) begin
+            $fclose(lut_fd);
+            $readmemh("../src/LUTs/reciprocal_lut.hex", reciprocal_lut);
+        end else begin
+            lut_fd = $fopen("../../src/LUTs/reciprocal_lut.hex", "r");
+            if (lut_fd != 0) begin
+                $fclose(lut_fd);
+                $readmemh("../../src/LUTs/reciprocal_lut.hex", reciprocal_lut);
+            end else begin
+                $display("ERROR: ffn could not locate reciprocal_lut.hex");
+                $finish;
+            end
+        end
+    end
+end
 
 always @(*) begin
     act_rd_en = 1'b0;
@@ -129,7 +222,45 @@ always @(*) begin
         wgt_rd_en = 1'b1;
         wgt_rd_addr = `WGT_RMS_FFN_BASE + rms_wgt_rd_addr;
     end
+
+    mul_a = 32'd0;
+    mul_b = 32'd0;
+    add_a = 32'd0;
+    add_b = 32'd0;
+
+    case (state)
+        STATE_SILU_DENOM: begin
+            add_a = FP_ONE_BITS;
+            add_b = exp_bits;
+        end
+        STATE_SILU_SIGM: begin
+            mul_a = numerator_bits;
+            mul_b = recip_bits;
+        end
+        STATE_SILU_XMUL: begin
+            mul_a = hb_bits;
+            mul_b = sigmoid_bits;
+        end
+        STATE_SILU_FINAL: begin
+            mul_a = silu_bits;
+            mul_b = hb2_bits;
+        end
+        default: begin
+        end
+    endcase
 end
+
+kernel_mul u_local_mul (
+    .a(mul_a),
+    .b(mul_b),
+    .y(mul_y)
+);
+
+kernel_add u_local_add (
+    .a(add_a),
+    .b(add_b),
+    .y(add_y)
+);
 
 kernel_rmsnorm #(
     .DIM(DIM)
@@ -189,9 +320,15 @@ always @(posedge clk or negedge rst_n) begin
         busy <= 1'b0;
         done <= 1'b0;
         silu_idx <= 0;
-        val <= 0.0;
-        hb_val <= 0.0;
-        hb2_val <= 0.0;
+        hb_bits <= 32'd0;
+        hb2_bits <= 32'd0;
+        exp_input_bits <= 32'd0;
+        exp_bits <= 32'd0;
+        numerator_bits <= 32'd0;
+        denom_bits <= 32'd0;
+        recip_bits <= 32'd0;
+        sigmoid_bits <= 32'd0;
+        silu_bits <= 32'd0;
     end else begin
         done <= 1'b0;
         local_act_rd_en <= 1'b0;
@@ -245,7 +382,7 @@ always @(posedge clk or negedge rst_n) begin
 
             STATE_SILU_RD0C: begin
                 busy <= 1'b1;
-                hb_val <= fp32_to_real(act_rd_data);
+                hb_bits <= act_rd_data;
                 state <= STATE_SILU_RD1;
             end
 
@@ -263,8 +400,53 @@ always @(posedge clk or negedge rst_n) begin
 
             STATE_SILU_RD1C: begin
                 busy <= 1'b1;
-                hb2_val <= fp32_to_real(act_rd_data);
-                val <= hb_val * (1.0 / (1.0 + $exp(-hb_val)));
+                hb2_bits <= act_rd_data;
+                if (hb_bits[31]) begin
+                    exp_input_bits <= hb_bits;
+                end else begin
+                    exp_input_bits <= {~hb_bits[31], hb_bits[30:0]};
+                end
+                state <= STATE_SILU_EXP;
+            end
+
+            STATE_SILU_EXP: begin
+                busy <= 1'b1;
+                exp_bits <= exp_lut[exp_lut_index_nonpos(exp_input_bits)];
+                state <= STATE_SILU_DENOM;
+            end
+
+            STATE_SILU_DENOM: begin
+                busy <= 1'b1;
+                denom_bits <= add_y;
+                if (hb_bits[31]) begin
+                    numerator_bits <= exp_bits;
+                end else begin
+                    numerator_bits <= FP_ONE_BITS;
+                end
+                state <= STATE_SILU_RECIP;
+            end
+
+            STATE_SILU_RECIP: begin
+                busy <= 1'b1;
+                recip_bits <= reciprocal_lut[lut_index_from_bits(denom_bits)];
+                state <= STATE_SILU_SIGM;
+            end
+
+            STATE_SILU_SIGM: begin
+                busy <= 1'b1;
+                sigmoid_bits <= mul_y;
+                state <= STATE_SILU_XMUL;
+            end
+
+            STATE_SILU_XMUL: begin
+                busy <= 1'b1;
+                silu_bits <= mul_y;
+                state <= STATE_SILU_FINAL;
+            end
+
+            STATE_SILU_FINAL: begin
+                busy <= 1'b1;
+                local_act_wr_data <= mul_y;
                 state <= STATE_SILU_WR;
             end
 
@@ -272,7 +454,6 @@ always @(posedge clk or negedge rst_n) begin
                 busy <= 1'b1;
                 local_act_wr_en <= 1'b1;
                 local_act_wr_addr <= `ACT_HB_BASE + silu_idx;
-                local_act_wr_data <= real_to_fp32_bits(fp32_round(val * hb2_val));
                 if (silu_idx == (HIDDEN_DIM - 1)) begin
                     state <= STATE_W2_START;
                 end else begin
